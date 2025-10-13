@@ -1,0 +1,41 @@
+# === Ignore all build output for all projects ===
+**/[Bb]in/
+**/[Oo]bj/
+**/docs/
+
+# === Ignore user-specific files ===
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# TFVC-specific folders
+$tf/
+$tf2/
+*.vssscc
+*.vspscc
+*.scc
+
+# === Ignore VS folders ===
+.vs/
+.vscode/
+
+# === Ignore NuGet files ===
+*.nupkg
+*.snupkg
+*.nuspec
+packages/
+project.lock.json
+project.assets.json
+
+# === Ignore common temp/log/cache ===
+*.log
+*.tmp
+*.bak
+*.orig
+*.cache
+*.db
+
+# === Optional: Ignore publish folders if you publish manually ===
+**/PublishOutput/
+**/ReleaseBuild/
