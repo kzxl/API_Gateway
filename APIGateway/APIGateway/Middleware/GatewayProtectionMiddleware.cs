@@ -1,35 +1,34 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http.Json;
 using APIGateway.Data;
 using APIGateway.Models;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace APIGateway.Middleware;
 
 /// <summary>
 /// Combined middleware: Rate Limiting + IP Filter + Circuit Breaker + Request Logging.
-/// Runs BEFORE proxy, handles all protection logic in a single pass.
+/// Integrates with GoFlow Sidecar Engine for extreme performance.
 /// </summary>
 public class GatewayProtectionMiddleware
 {
     private readonly RequestDelegate _next;
+    private readonly IMemoryCache _cache;
+    private readonly IServiceScopeFactory _scopeFactory;
 
-    // ── Rate Limiting: per routeId per IP, sliding window ──
-    private static readonly ConcurrentDictionary<string, RateLimitBucket> _rateLimits = new();
+    // GoFlow Engine Client
+    private static readonly HttpClient _goFlowClient = new() { BaseAddress = new Uri("http://127.0.0.1:50051") };
 
     // ── Circuit Breaker: per routeId ──
     private static readonly ConcurrentDictionary<string, CircuitState> _circuits = new();
 
-    // ── Logging queue (background flush) ──
-    private static readonly ConcurrentQueue<RequestLog> _logQueue = new();
-    private static Timer? _flushTimer;
-    private static IServiceScopeFactory? _scopeFactory;
-
-    public GatewayProtectionMiddleware(RequestDelegate next, IServiceScopeFactory scopeFactory)
+    public GatewayProtectionMiddleware(RequestDelegate next, IMemoryCache cache, IServiceScopeFactory scopeFactory)
     {
         _next = next;
-        _scopeFactory ??= scopeFactory;
-        _flushTimer ??= new Timer(FlushLogs, null, 3000, 3000);
+        _cache = cache;
+        _scopeFactory = scopeFactory;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -41,29 +40,29 @@ public class GatewayProtectionMiddleware
             return;
         }
 
-        // Resolve route config from DB
-        Models.Route? routeConfig = null;
-        using (var scope = _scopeFactory!.CreateScope())
+        // ── 1. Resolve route config from Memory Cache (No DB hit) ──
+        if (!_cache.TryGetValue("GatewayRoutes", out List<Models.Route>? routes) || routes == null)
         {
+            using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
-            var routes = await db.Routes.ToListAsync();
-            // Find best matching route
-            routeConfig = routes.FirstOrDefault(r =>
-                path.StartsWith(r.MatchPath.Replace("/{**catch-all}", "").Replace("{**catch-all}", ""))
-                || r.MatchPath == "/{**catch-all}");
+            routes = await db.Routes.ToListAsync();
+            _cache.Set("GatewayRoutes", routes, TimeSpan.FromMinutes(5));
         }
 
-        var clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        // Find best matching route
+        var routeConfig = routes.FirstOrDefault(r =>
+            path.StartsWith(r.MatchPath.Replace("/{**catch-all}", "").Replace("{**catch-all}", ""))
+            || r.MatchPath == "/{**catch-all}");
+
+        var clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
         var routeId = routeConfig?.RouteId ?? "unknown";
 
-        // ── 1. IP Filter ──
+        // ── 2. IP Filter ──
         if (routeConfig != null)
         {
             if (!string.IsNullOrWhiteSpace(routeConfig.IpBlacklist))
             {
-                var blocked = routeConfig.IpBlacklist.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(x => x.Trim());
-                if (blocked.Any(ip => clientIp.Contains(ip)))
+                if (routeConfig.IpBlacklist.Contains(clientIp))
                 {
                     context.Response.StatusCode = 403;
                     await context.Response.WriteAsJsonAsync(new { error = "IP blocked" });
@@ -72,9 +71,7 @@ public class GatewayProtectionMiddleware
             }
             if (!string.IsNullOrWhiteSpace(routeConfig.IpWhitelist))
             {
-                var allowed = routeConfig.IpWhitelist.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(x => x.Trim());
-                if (!allowed.Any(ip => clientIp.Contains(ip)))
+                if (!routeConfig.IpWhitelist.Contains(clientIp))
                 {
                     context.Response.StatusCode = 403;
                     await context.Response.WriteAsJsonAsync(new { error = "IP not allowed" });
@@ -83,26 +80,42 @@ public class GatewayProtectionMiddleware
             }
         }
 
-        // ── 2. Rate Limiting ──
+        // ── 3. Rate Limiting (via GoFlow Engine) ──
         if (routeConfig != null && routeConfig.RateLimitPerSecond > 0)
         {
-            var key = $"{routeId}:{clientIp}";
-            var bucket = _rateLimits.GetOrAdd(key, _ => new RateLimitBucket());
-            if (!bucket.TryConsume(routeConfig.RateLimitPerSecond))
+            try
             {
-                context.Response.StatusCode = 429;
-                context.Response.Headers["Retry-After"] = "1";
-                await context.Response.WriteAsJsonAsync(new
+                var response = await _goFlowClient.PostAsJsonAsync("/ratelimit", new
                 {
-                    error = "Too many requests",
-                    retryAfter = 1,
-                    limit = routeConfig.RateLimitPerSecond
+                    routeId = routeId,
+                    ip = clientIp,
+                    limitPerSec = routeConfig.RateLimitPerSecond
                 });
-                return;
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var result = await response.Content.ReadFromJsonAsync<RateLimitResponse>();
+                    if (result != null && !result.Allowed)
+                    {
+                        context.Response.StatusCode = 429;
+                        context.Response.Headers["Retry-After"] = "1";
+                        await context.Response.WriteAsJsonAsync(new
+                        {
+                            error = "Too many requests",
+                            retryAfter = 1,
+                            limit = routeConfig.RateLimitPerSecond
+                        });
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback / fail-open if GoFlow is down
             }
         }
 
-        // ── 3. Circuit Breaker ──
+        // ── 4. Circuit Breaker ──
         if (routeConfig != null && routeConfig.CircuitBreakerThreshold > 0)
         {
             var circuit = _circuits.GetOrAdd(routeId, _ => new CircuitState());
@@ -145,40 +158,38 @@ public class GatewayProtectionMiddleware
                 if (circuit.GetErrorRate() >= routeConfig.CircuitBreakerThreshold)
                     circuit.Trip();
             }
+            // Send error log to GoFlow before throwing
+            FireAndForgetLog(context, path, 500, sw.ElapsedMilliseconds, clientIp, routeId);
             throw;
         }
 
-        // ── 4. Log request (async queue) ──
-        _logQueue.Enqueue(new RequestLog
-        {
-            Timestamp = DateTime.UtcNow,
-            Method = context.Request.Method,
-            Path = path,
-            StatusCode = context.Response.StatusCode,
-            LatencyMs = sw.ElapsedMilliseconds,
-            ClientIp = clientIp,
-            RouteId = routeId,
-            UserAgent = context.Request.Headers.UserAgent.FirstOrDefault()
-        });
+        // ── 5. Log request (via GoFlow Engine) ──
+        FireAndForgetLog(context, path, context.Response.StatusCode, sw.ElapsedMilliseconds, clientIp, routeId);
     }
 
-    private static void FlushLogs(object? state)
+    private void FireAndForgetLog(HttpContext context, string path, int statusCode, long latencyMs, string clientIp, string routeId)
     {
-        if (_logQueue.IsEmpty || _scopeFactory == null) return;
-        var logs = new List<RequestLog>();
-        while (_logQueue.TryDequeue(out var log) && logs.Count < 100)
-            logs.Add(log);
-
-        if (logs.Count == 0) return;
-
-        try
+        var logReq = new
         {
-            using var scope = _scopeFactory.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
-            db.RequestLogs.AddRange(logs);
-            db.SaveChanges();
-        }
-        catch { /* log flush failure - non-critical */ }
+            timestamp = DateTime.UtcNow.ToString("O"),
+            method = context.Request.Method,
+            path = path,
+            statusCode = statusCode,
+            latencyMs = latencyMs,
+            clientIp = clientIp,
+            routeId = routeId,
+            userAgent = context.Request.Headers.UserAgent.FirstOrDefault() ?? ""
+        };
+
+        // Fire and forget HTTP POST to GoFlow (no await)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _goFlowClient.PostAsJsonAsync("/log", logReq);
+            }
+            catch { /* Ignore logging errors */ }
+        });
     }
 
     // ── Circuit Breaker state tracking ──
@@ -191,24 +202,10 @@ public class GatewayProtectionMiddleware
             totalRequests = kv.Value.TotalRequests
         });
     }
-}
 
-internal class RateLimitBucket
-{
-    private readonly ConcurrentQueue<DateTime> _timestamps = new();
-
-    public bool TryConsume(int maxPerSecond)
+    private class RateLimitResponse
     {
-        var now = DateTime.UtcNow;
-        // Clean old entries
-        while (_timestamps.TryPeek(out var oldest) && (now - oldest).TotalSeconds > 1)
-            _timestamps.TryDequeue(out _);
-
-        if (_timestamps.Count >= maxPerSecond)
-            return false;
-
-        _timestamps.Enqueue(now);
-        return true;
+        public bool Allowed { get; set; }
     }
 }
 

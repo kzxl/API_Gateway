@@ -83,6 +83,8 @@ builder.Services.AddCors(options =>
     });
 });
 
+builder.Services.AddMemoryCache();
+
 var app = builder.Build();
 
 // ==============================
