@@ -47,17 +47,35 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
             var routes = repo.GetRoutesAsync().GetAwaiter().GetResult();
             var clusters = repo.GetClustersAsync().GetAwaiter().GetResult();
 
-            var routeConfigs = routes.Select(r => new RouteConfig
+            var routeConfigs = routes.Select(r =>
             {
-                RouteId = r.RouteId,
-                Match = new RouteMatch
+                var rc = new RouteConfig
                 {
-                    Path = r.MatchPath,
-                    Methods = string.IsNullOrWhiteSpace(r.Methods)
-                        ? null
-                        : r.Methods.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                },
-                ClusterId = r.ClusterId
+                    RouteId = r.RouteId,
+                    Match = new RouteMatch
+                    {
+                        Path = r.MatchPath,
+                        Methods = string.IsNullOrWhiteSpace(r.Methods)
+                            ? null
+                            : r.Methods.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    },
+                    ClusterId = r.ClusterId
+                };
+
+                // Map transforms from JSON
+                if (!string.IsNullOrWhiteSpace(r.TransformsJson))
+                {
+                    try
+                    {
+                        var transforms = JsonSerializer.Deserialize<List<Dictionary<string, string>>>(
+                            r.TransformsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        if (transforms != null)
+                            rc = rc with { Transforms = transforms };
+                    }
+                    catch { /* invalid transforms JSON */ }
+                }
+
+                return rc;
             }).ToList();
 
             var clusterList = clusters.Select(c =>
@@ -101,6 +119,23 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
                                 Policy = "TransportFailureRate",
                                 ReactivationPeriod = TimeSpan.FromSeconds(30)
                             }
+                        }
+                    };
+                }
+
+                // Apply retry policy
+                if (c.RetryCount > 0)
+                {
+                    config = config with
+                    {
+                        HttpRequest = new Yarp.ReverseProxy.Forwarder.ForwarderRequestConfig
+                        {
+                            ActivityTimeout = TimeSpan.FromSeconds(100)
+                        },
+                        Metadata = new Dictionary<string, string>
+                        {
+                            ["RetryCount"] = c.RetryCount.ToString(),
+                            ["RetryDelay"] = c.RetryDelayMs.ToString()
                         }
                     };
                 }

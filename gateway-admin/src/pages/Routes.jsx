@@ -1,207 +1,204 @@
 import React, { useEffect, useState } from "react";
 import {
-  Table,
-  Button,
-  Modal,
-  Form,
-  Input,
-  Select,
-  Popconfirm,
-  Space,
-  Tag,
-  App,
-  Typography,
+  Table, Button, Modal, Form, Input, Space, App, Typography, Tag, Popconfirm, InputNumber,
+  Divider, Switch, Collapse,
 } from "antd";
-import {
-  PlusOutlined,
-  EditOutlined,
-  DeleteOutlined,
-} from "@ant-design/icons";
-import {
-  getRoutes,
-  createRoute,
-  updateRoute,
-  deleteRoute,
-  getClusters,
-} from "../api/gatewayApi";
+import { PlusOutlined, EditOutlined, DeleteOutlined, ReloadOutlined, ThunderboltOutlined, SafetyOutlined } from "@ant-design/icons";
+import { getRoutes, createRoute, updateRoute, deleteRoute } from "../api/gatewayApi";
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
-export default function Routes() {
+export default function RoutesPage() {
   const { message } = App.useApp();
   const [routes, setRoutes] = useState([]);
-  const [clusters, setClusters] = useState([]);
-  const [open, setOpen] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
   const [form] = Form.useForm();
 
   const load = async () => {
     setLoading(true);
-    try {
-      const [r, c] = await Promise.all([getRoutes(), getClusters()]);
-      setRoutes(r.data);
-      setClusters(c.data);
-    } catch (err) {
-      message.error("Failed to load routes: " + (err.response?.data?.error || err.message));
-    } finally {
-      setLoading(false);
-    }
+    try { const res = await getRoutes(); setRoutes(res.data); }
+    catch { message.error("Failed to load routes"); }
+    finally { setLoading(false); }
   };
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
-  const openCreate = () => {
+  const openModal = (route = null) => {
+    setEditing(route);
     form.resetFields();
-    setEditingId(null);
-    setOpen(true);
-  };
-
-  const openEdit = (record) => {
-    form.setFieldsValue(record);
-    setEditingId(record.id);
-    setOpen(true);
-  };
-
-  const handleSubmit = async () => {
-    try {
-      const values = await form.validateFields();
-      if (editingId) {
-        await updateRoute(editingId, { ...values, id: editingId });
-        message.success("Route updated");
-      } else {
-        await createRoute(values);
-        message.success("Route created");
-      }
-      setOpen(false);
-      load();
-    } catch (err) {
-      if (err.response) {
-        message.error(err.response.data?.error || "Save failed");
-      }
+    if (route) {
+      form.setFieldsValue({
+        ...route,
+        enableCircuitBreaker: route.circuitBreakerThreshold > 0,
+        enableRateLimit: route.rateLimitPerSecond > 0,
+        enableCache: route.cacheTtlSeconds > 0,
+      });
     }
+    setModalOpen(true);
+  };
+
+  const handleSave = async () => {
+    const values = await form.validateFields();
+    const payload = {
+      routeId: values.routeId,
+      matchPath: values.matchPath,
+      methods: values.methods,
+      clusterId: values.clusterId,
+      rateLimitPerSecond: values.enableRateLimit ? (values.rateLimitPerSecond || 100) : 0,
+      circuitBreakerThreshold: values.enableCircuitBreaker ? (values.circuitBreakerThreshold || 50) : 0,
+      circuitBreakerDurationSeconds: values.circuitBreakerDurationSeconds || 30,
+      ipWhitelist: values.ipWhitelist || null,
+      ipBlacklist: values.ipBlacklist || null,
+      cacheTtlSeconds: values.enableCache ? (values.cacheTtlSeconds || 60) : 0,
+      transformsJson: values.transformsJson || null,
+    };
+
+    if (editing) {
+      await updateRoute(editing.id, payload);
+      message.success("Route updated");
+    } else {
+      await createRoute(payload);
+      message.success("Route created");
+    }
+    setModalOpen(false);
+    load();
   };
 
   const handleDelete = async (id) => {
-    try {
-      await deleteRoute(id);
-      message.success("Route deleted");
-      load();
-    } catch (err) {
-      message.error("Delete failed");
-    }
+    await deleteRoute(id);
+    message.success("Route deleted");
+    load();
   };
-
-  const columns = [
-    {
-      title: "Route ID",
-      dataIndex: "routeId",
-      render: (v) => <Tag color="blue">{v}</Tag>,
-    },
-    {
-      title: "Path",
-      dataIndex: "matchPath",
-      render: (v) => <code>{v}</code>,
-    },
-    {
-      title: "Methods",
-      dataIndex: "methods",
-      render: (v) =>
-        v
-          ? v.split(",").map((m) => (
-              <Tag key={m} color="green">
-                {m.trim()}
-              </Tag>
-            ))
-          : <Tag>ALL</Tag>,
-    },
-    {
-      title: "Cluster",
-      dataIndex: "clusterId",
-      render: (v) => <Tag color="purple">{v}</Tag>,
-    },
-    {
-      title: "Actions",
-      width: 120,
-      render: (_, record) => (
-        <Space>
-          <Button
-            type="text"
-            icon={<EditOutlined />}
-            onClick={() => openEdit(record)}
-          />
-          <Popconfirm
-            title="Delete this route?"
-            onConfirm={() => handleDelete(record.id)}
-          >
-            <Button type="text" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
-        </Space>
-      ),
-    },
-  ];
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
-        <Title level={3} style={{ margin: 0 }}>
-          Routes
-        </Title>
-        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-          Add Route
-        </Button>
+        <Title level={3} style={{ margin: 0 }}>Routes</Title>
+        <Space>
+          <Button icon={<ReloadOutlined />} onClick={load}>Refresh</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => openModal()}>Add Route</Button>
+        </Space>
       </div>
 
-      <Table
-        dataSource={routes}
-        columns={columns}
-        rowKey="id"
-        loading={loading}
-        size="middle"
-        pagination={{ pageSize: 10 }}
+      <Table dataSource={routes} rowKey="id" loading={loading} size="small"
+        columns={[
+          { title: "Route ID", dataIndex: "routeId", render: (v) => <Tag color="blue">{v}</Tag> },
+          { title: "Path", dataIndex: "matchPath" },
+          { title: "Methods", dataIndex: "methods", render: (v) => v || <Text type="secondary">ALL</Text> },
+          { title: "Cluster", dataIndex: "clusterId", render: (v) => <Tag>{v}</Tag> },
+          {
+            title: "Protection", render: (_, r) => (
+              <Space wrap>
+                {r.rateLimitPerSecond > 0 && <Tag color="orange">⚡ {r.rateLimitPerSecond}/s</Tag>}
+                {r.circuitBreakerThreshold > 0 && <Tag color="red">🔌 CB {r.circuitBreakerThreshold}%</Tag>}
+                {r.ipWhitelist && <Tag color="green">🛡 Whitelist</Tag>}
+                {r.ipBlacklist && <Tag color="volcano">🚫 Blacklist</Tag>}
+                {r.cacheTtlSeconds > 0 && <Tag color="purple">💾 Cache {r.cacheTtlSeconds}s</Tag>}
+              </Space>
+            ),
+          },
+          {
+            title: "Actions", width: 100, render: (_, r) => (
+              <Space>
+                <Button size="small" icon={<EditOutlined />} onClick={() => openModal(r)} />
+                <Popconfirm title="Delete route?" onConfirm={() => handleDelete(r.id)}>
+                  <Button size="small" danger icon={<DeleteOutlined />} />
+                </Popconfirm>
+              </Space>
+            ),
+          },
+        ]}
       />
 
-      <Modal
-        title={editingId ? "Edit Route" : "Add Route"}
-        open={open}
-        onCancel={() => setOpen(false)}
-        onOk={handleSubmit}
-        okText={editingId ? "Update" : "Create"}
-        destroyOnClose
-      >
+      <Modal title={editing ? "Edit Route" : "New Route"} open={modalOpen} width={600}
+        onOk={handleSave} onCancel={() => setModalOpen(false)}>
         <Form form={form} layout="vertical">
-          <Form.Item
-            name="routeId"
-            label="Route ID"
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <Input placeholder="e.g. user-api-route" />
+          <Form.Item name="routeId" label="Route ID" rules={[{ required: true }]}>
+            <Input placeholder="my-route" />
           </Form.Item>
-          <Form.Item
-            name="matchPath"
-            label="Match Path"
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <Input placeholder="e.g. /api/users/{**catch-all}" />
+          <Form.Item name="matchPath" label="Match Path" rules={[{ required: true }]}>
+            <Input placeholder="/{**catch-all}" />
           </Form.Item>
           <Form.Item name="methods" label="Methods (comma-separated)">
-            <Input placeholder="e.g. GET,POST or leave empty for ALL" />
+            <Input placeholder="GET,POST (leave empty for all)" />
           </Form.Item>
-          <Form.Item
-            name="clusterId"
-            label="Cluster"
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <Select
-              placeholder="Select a cluster"
-              options={clusters.map((c) => ({
-                label: c.clusterId,
-                value: c.clusterId,
-              }))}
-            />
+          <Form.Item name="clusterId" label="Cluster ID" rules={[{ required: true }]}>
+            <Input placeholder="my-cluster" />
           </Form.Item>
+
+          <Collapse ghost items={[
+            {
+              key: "protection",
+              label: <><SafetyOutlined /> Protection Settings</>,
+              children: (
+                <>
+                  <Form.Item name="enableRateLimit" label="Rate Limiting" valuePropName="checked">
+                    <Switch checkedChildren="ON" unCheckedChildren="OFF" />
+                  </Form.Item>
+                  <Form.Item noStyle shouldUpdate>
+                    {({ getFieldValue }) => getFieldValue("enableRateLimit") && (
+                      <Form.Item name="rateLimitPerSecond" label="Max Requests/Second">
+                        <InputNumber min={1} max={10000} placeholder="100" style={{ width: "100%" }} />
+                      </Form.Item>
+                    )}
+                  </Form.Item>
+
+                  <Divider />
+
+                  <Form.Item name="enableCircuitBreaker" label="Circuit Breaker" valuePropName="checked">
+                    <Switch checkedChildren="ON" unCheckedChildren="OFF" />
+                  </Form.Item>
+                  <Form.Item noStyle shouldUpdate>
+                    {({ getFieldValue }) => getFieldValue("enableCircuitBreaker") && (
+                      <>
+                        <Form.Item name="circuitBreakerThreshold" label="Error Threshold (%)">
+                          <InputNumber min={1} max={100} placeholder="50" style={{ width: "100%" }} />
+                        </Form.Item>
+                        <Form.Item name="circuitBreakerDurationSeconds" label="Reset Duration (seconds)">
+                          <InputNumber min={5} max={600} placeholder="30" style={{ width: "100%" }} />
+                        </Form.Item>
+                      </>
+                    )}
+                  </Form.Item>
+
+                  <Divider />
+
+                  <Form.Item name="ipWhitelist" label="IP Whitelist (comma-separated)">
+                    <Input placeholder="192.168.1.1, 10.0.0.0" />
+                  </Form.Item>
+                  <Form.Item name="ipBlacklist" label="IP Blacklist (comma-separated)">
+                    <Input placeholder="1.2.3.4" />
+                  </Form.Item>
+                </>
+              ),
+            },
+            {
+              key: "advanced",
+              label: <><ThunderboltOutlined /> Advanced Settings</>,
+              children: (
+                <>
+                  <Form.Item name="enableCache" label="Response Caching (GET only)" valuePropName="checked">
+                    <Switch checkedChildren="ON" unCheckedChildren="OFF" />
+                  </Form.Item>
+                  <Form.Item noStyle shouldUpdate>
+                    {({ getFieldValue }) => getFieldValue("enableCache") && (
+                      <Form.Item name="cacheTtlSeconds" label="Cache TTL (seconds)">
+                        <InputNumber min={1} max={86400} placeholder="60" style={{ width: "100%" }} />
+                      </Form.Item>
+                    )}
+                  </Form.Item>
+
+                  <Divider />
+
+                  <Form.Item name="transformsJson" label="Transforms (JSON)">
+                    <Input.TextArea rows={3} placeholder='[{"PathPrefix":"/api"}]' />
+                  </Form.Item>
+                </>
+              ),
+            },
+          ]} />
         </Form>
       </Modal>
     </div>

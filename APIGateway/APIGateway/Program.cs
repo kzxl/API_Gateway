@@ -78,6 +78,18 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
     db.Database.EnsureCreated();
 
+    // Seed default admin user
+    if (!db.Users.Any())
+    {
+        db.Users.Add(new User
+        {
+            Username = "admin",
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword("admin123"),
+            Role = "Admin",
+            IsActive = true
+        });
+    }
+
     if (!db.Clusters.Any())
     {
         db.Clusters.Add(new Cluster
@@ -98,7 +110,8 @@ using (var scope = app.Services.CreateScope())
         {
             RouteId = "default-route",
             ClusterId = "default-cluster",
-            MatchPath = "/{**catch-all}"
+            MatchPath = "/{**catch-all}",
+            RateLimitPerSecond = 100
         });
     }
 
@@ -116,8 +129,11 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors("AllowAdminUI");
 
-// Metrics tracking (before auth, so we count all requests)
+// Metrics tracking
 app.UseMiddleware<MetricsMiddleware>();
+
+// Gateway protection: IP filter → Rate limit → Circuit breaker → Logging
+app.UseMiddleware<GatewayProtectionMiddleware>();
 
 // JWT auth for proxy traffic
 app.UseAuthentication();

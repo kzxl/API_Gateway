@@ -10,22 +10,20 @@ public class Cluster
 
     /// <summary>
     /// JSON array: [{"id":"dest-1","address":"http://host:port","health":"Active"}]
-    /// health: "Active" (primary) | "Standby" (failover only)
     /// </summary>
     public string DestinationsJson { get; set; } = "[]";
 
-    // ── Health Check Config ──
+    // ── Health Check ──
     public bool EnableHealthCheck { get; set; } = true;
-
-    /// <summary>Health probe path on each destination, e.g. "/health"</summary>
     public string HealthCheckPath { get; set; } = "/health";
-
-    /// <summary>Probe interval in seconds</summary>
     public int HealthCheckIntervalSeconds { get; set; } = 10;
-
-    /// <summary>Probe timeout in seconds</summary>
     public int HealthCheckTimeoutSeconds { get; set; } = 5;
 
-    /// <summary>Load balancing policy: RoundRobin, Random, LeastRequests, FirstAlphabetical, PowerOfTwoChoices</summary>
+    // ── Load Balancing ──
     public string LoadBalancingPolicy { get; set; } = "RoundRobin";
+
+    // ── Retry Policy ──
+    /// <summary>Number of retries on failure. 0 = no retry</summary>
+    public int RetryCount { get; set; } = 0;
+    public int RetryDelayMs { get; set; } = 1000;
 }

@@ -107,6 +107,9 @@ export default function Clusters() {
       healthCheckIntervalSeconds: record.healthCheckIntervalSeconds || 10,
       healthCheckTimeoutSeconds: record.healthCheckTimeoutSeconds || 5,
       loadBalancingPolicy: record.loadBalancingPolicy || "RoundRobin",
+      enableRetry: (record.retryCount || 0) > 0,
+      retryCount: record.retryCount || 3,
+      retryDelayMs: record.retryDelayMs || 1000,
     });
     setEditingId(record.id);
     setOpen(true);
@@ -150,6 +153,8 @@ export default function Clusters() {
         healthCheckIntervalSeconds: values.healthCheckIntervalSeconds || 10,
         healthCheckTimeoutSeconds: values.healthCheckTimeoutSeconds || 5,
         loadBalancingPolicy: values.loadBalancingPolicy || "RoundRobin",
+        retryCount: values.enableRetry ? (values.retryCount || 3) : 0,
+        retryDelayMs: values.retryDelayMs || 1000,
       };
 
       if (editingId) {
@@ -388,6 +393,32 @@ export default function Clusters() {
           <Form.Item name="loadBalancingPolicy" label="Load Balancing Policy">
             <Select options={LB_POLICIES} />
           </Form.Item>
+
+          {/* ── Retry Policy ── */}
+          <Divider orientation="left" plain>
+            Retry Policy
+          </Divider>
+          <Card size="small">
+            <Form.Item name="enableRetry" label="Enable Retry" valuePropName="checked">
+              <Switch checkedChildren="ON" unCheckedChildren="OFF" />
+            </Form.Item>
+            <Form.Item noStyle shouldUpdate>
+              {({ getFieldValue }) => getFieldValue("enableRetry") && (
+                <Row gutter={16}>
+                  <Col span={12}>
+                    <Form.Item name="retryCount" label="Max Retries">
+                      <InputNumber min={1} max={10} placeholder="3" style={{ width: "100%" }} />
+                    </Form.Item>
+                  </Col>
+                  <Col span={12}>
+                    <Form.Item name="retryDelayMs" label="Delay (ms)">
+                      <InputNumber min={100} max={30000} step={100} placeholder="1000" style={{ width: "100%" }} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              )}
+            </Form.Item>
+          </Card>
         </Form>
       </Modal>
     </div>

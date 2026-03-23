@@ -1,4 +1,6 @@
+using APIGateway.Data;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -11,36 +13,40 @@ namespace APIGateway.Controllers;
 public class AuthController : ControllerBase
 {
     private readonly IConfiguration _config;
+    private readonly GatewayDbContext _db;
 
-    public AuthController(IConfiguration config) => _config = config;
+    public AuthController(IConfiguration config, GatewayDbContext db)
+    {
+        _config = config;
+        _db = db;
+    }
 
     /// <summary>
-    /// Login to get JWT token. Gateway is the ONLY public entry point.
-    /// Backend services are internal and don't need auth.
+    /// Login with credentials from DB (BCrypt verified).
+    /// Gateway is the ONLY public entry point.
     /// </summary>
     [HttpPost("login")]
-    public IActionResult Login([FromBody] LoginRequest request)
+    public async Task<IActionResult> Login([FromBody] LoginRequest request)
     {
-        // Simple demo auth - replace with real user validation
         if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
             return BadRequest(new { error = "Username and password are required" });
 
-        // TODO: Replace with real user store (DB, LDAP, etc.)
-        if (request.Username != "admin" || request.Password != "admin123")
+        var user = await _db.Users.FirstOrDefaultAsync(u =>
+            u.Username == request.Username && u.IsActive);
+
+        if (user == null || !BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
             return Unauthorized(new { error = "Invalid credentials" });
 
-        var token = GenerateJwtToken(request.Username, "Admin");
+        var token = GenerateJwtToken(user.Username, user.Role);
         return Ok(new
         {
             token,
             expiresIn = int.Parse(_config["Jwt:ExpirationMinutes"] ?? "60") * 60,
-            tokenType = "Bearer"
+            tokenType = "Bearer",
+            user = new { user.Username, user.Role }
         });
     }
 
-    /// <summary>
-    /// Validate a token and return its claims
-    /// </summary>
     [HttpPost("validate")]
     public IActionResult Validate([FromBody] ValidateRequest request)
     {

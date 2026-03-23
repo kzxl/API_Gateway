@@ -1,6 +1,5 @@
-﻿using APIGateway.Models;
+using APIGateway.Models;
 using Microsoft.EntityFrameworkCore;
-using System.Collections.Generic;
 
 namespace APIGateway.Data
 {
@@ -9,5 +8,7 @@ namespace APIGateway.Data
         public GatewayDbContext(DbContextOptions<GatewayDbContext> opts) : base(opts) { }
         public DbSet<Models.Route> Routes { get; set; }
         public DbSet<Cluster> Clusters { get; set; }
+        public DbSet<User> Users { get; set; }
+        public DbSet<RequestLog> RequestLogs { get; set; }
     }
 }

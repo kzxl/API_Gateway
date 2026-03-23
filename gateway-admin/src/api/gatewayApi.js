@@ -37,3 +37,18 @@ export const getHealth = () => api.get("/admin/health");
 // ── Metrics ──
 export const getMetrics = () => api.get("/admin/metrics");
 export const resetMetrics = () => api.delete("/admin/metrics");
+
+// ── Users ──
+export const getUsers = () => api.get("/admin/users");
+export const createUser = (data) => api.post("/admin/users", data);
+export const updateUser = (id, data) => api.put(`/admin/users/${id}`, data);
+export const deleteUser = (id) => api.delete(`/admin/users/${id}`);
+
+// ── Logs ──
+export const getLogs = (params) => api.get("/admin/logs", { params });
+export const clearLogs = () => api.delete("/admin/logs");
+export const getLogStats = () => api.get("/admin/logs/stats");
+
+// ── Config Import/Export ──
+export const exportConfig = () => api.get("/admin/config/export");
+export const importConfig = (data) => api.post("/admin/config/import", data);
