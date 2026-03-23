@@ -27,6 +27,8 @@ public class GatewayProtectionMiddleware
     private static readonly ConcurrentDictionary<string, TokenBucketRateLimiter> _rateLimiters = new();
     private static readonly ConcurrentQueue<RequestLog> _logQueue = new();
     private static Timer? _flushTimer;
+    private static Timer? _syncTimer;
+    private static long _lastRoutesVersion = 0;
 
     public GatewayProtectionMiddleware(RequestDelegate next, IMemoryCache cache, IServiceScopeFactory scopeFactory)
     {
@@ -36,6 +38,12 @@ public class GatewayProtectionMiddleware
         
         // Start background flusher for logs to GoFlow Engine (Batching)
         _flushTimer ??= new Timer(FlushLogsToGoFlow, null, 3000, 3000);
+
+        // L1-L2 Hybrid Sync: Poll routes version every 1 second from GoCache L2
+        if (_syncTimer == null)
+        {
+            _syncTimer = new Timer(SyncRoutesVersion, null, 1000, 1000);
+        }
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -47,7 +55,7 @@ public class GatewayProtectionMiddleware
             return;
         }
 
-        // ── 1. Resolve route config from Memory Cache (No DB hit) ──
+        // ── 1. Resolve route config from Memory Cache (No DB hit on pipeline) ──
         if (!_cache.TryGetValue("GatewayRoutes", out List<Models.Route>? routes) || routes == null)
         {
             try
@@ -55,7 +63,7 @@ public class GatewayProtectionMiddleware
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
                 routes = await db.Routes.AsNoTracking().ToListAsync();
-                _cache.Set("GatewayRoutes", routes, TimeSpan.FromMinutes(5));
+                _cache.Set("GatewayRoutes", routes, TimeSpan.FromDays(365)); // Cache forever, invalidated by Version Bump Sync
             }
             catch { routes = new List<Models.Route>(); }
         }
@@ -228,7 +236,33 @@ public class GatewayProtectionMiddleware
         }
     }
 
-    // ── Circuit Breaker state tracking ──
+    // ── Pre-allocated States and Sync Logic ──
+
+    private void SyncRoutesVersion(object? state)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var response = await _goFlowClient.GetFromJsonAsync<GoCacheVersion>("/cache/routes_version");
+                if (response != null && response.Version > _lastRoutesVersion)
+                {
+                    if (_lastRoutesVersion > 0) // Only remove cache if it's an actual update (not first pull)
+                    {
+                        _cache.Remove("GatewayRoutes");
+                    }
+                    _lastRoutesVersion = response.Version;
+                }
+            }
+            catch { /* Ignore */ }
+        });
+    }
+
+    private class GoCacheVersion
+    {
+        public long Version { get; set; }
+    }
+
     public static Dictionary<string, object> GetCircuitStates()
     {
         return _circuits.ToDictionary(kv => kv.Key, kv => (object)new

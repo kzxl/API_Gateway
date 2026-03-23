@@ -8,8 +8,17 @@ namespace APIGateway.Features.Routing;
 public class RouteService : IRouteService
 {
     private readonly GatewayDbContext _db;
+    private static readonly HttpClient _goFlowClient = new() { BaseAddress = new Uri("http://127.0.0.1:50051") };
 
     public RouteService(GatewayDbContext db) => _db = db;
+
+    private void BumpRoutesVersion()
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await _goFlowClient.PostAsync("/cache/routes_version/bump", null); } catch { }
+        });
+    }
 
     public async Task<List<RouteDto>> GetAllAsync()
     {
@@ -47,6 +56,8 @@ public class RouteService : IRouteService
         };
         _db.Routes.Add(route);
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return new RouteDto(route.Id, route.RouteId, route.MatchPath, route.Methods, route.ClusterId,
             route.RateLimitPerSecond, route.CircuitBreakerThreshold, route.CircuitBreakerDurationSeconds,
             route.IpWhitelist, route.IpBlacklist, route.CacheTtlSeconds, route.TransformsJson);
@@ -70,6 +81,8 @@ public class RouteService : IRouteService
         route.TransformsJson = dto.TransformsJson;
 
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return new RouteDto(route.Id, route.RouteId, route.MatchPath, route.Methods, route.ClusterId,
             route.RateLimitPerSecond, route.CircuitBreakerThreshold, route.CircuitBreakerDurationSeconds,
             route.IpWhitelist, route.IpBlacklist, route.CacheTtlSeconds, route.TransformsJson);
@@ -81,6 +94,8 @@ public class RouteService : IRouteService
         if (route == null) return false;
         _db.Routes.Remove(route);
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return true;
     }
 }

@@ -8,8 +8,17 @@ namespace APIGateway.Features.Clustering;
 public class ClusterService : IClusterService
 {
     private readonly GatewayDbContext _db;
+    private static readonly HttpClient _goFlowClient = new() { BaseAddress = new Uri("http://127.0.0.1:50051") };
 
     public ClusterService(GatewayDbContext db) => _db = db;
+
+    private void BumpRoutesVersion()
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await _goFlowClient.PostAsync("/cache/routes_version/bump", null); } catch { }
+        });
+    }
 
     public async Task<List<ClusterDto>> GetAllAsync()
     {
@@ -45,6 +54,8 @@ public class ClusterService : IClusterService
         };
         _db.Clusters.Add(cluster);
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return new ClusterDto(cluster.Id, cluster.ClusterId, cluster.DestinationsJson,
             cluster.EnableHealthCheck, cluster.HealthCheckPath, cluster.HealthCheckIntervalSeconds,
             cluster.HealthCheckTimeoutSeconds, cluster.LoadBalancingPolicy, cluster.RetryCount, cluster.RetryDelayMs);
@@ -66,6 +77,8 @@ public class ClusterService : IClusterService
         cluster.RetryDelayMs = dto.RetryDelayMs;
 
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return new ClusterDto(cluster.Id, cluster.ClusterId, cluster.DestinationsJson,
             cluster.EnableHealthCheck, cluster.HealthCheckPath, cluster.HealthCheckIntervalSeconds,
             cluster.HealthCheckTimeoutSeconds, cluster.LoadBalancingPolicy, cluster.RetryCount, cluster.RetryDelayMs);
@@ -77,6 +90,8 @@ public class ClusterService : IClusterService
         if (cluster == null) return false;
         _db.Clusters.Remove(cluster);
         await _db.SaveChangesAsync();
+        BumpRoutesVersion();
+        
         return true;
     }
 }
