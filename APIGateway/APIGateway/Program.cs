@@ -2,7 +2,10 @@ using APIGateway.Data;
 using APIGateway.Middleware;
 using APIGateway.Models;
 using APIGateway.Services;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
 using Yarp.ReverseProxy.Configuration;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -24,7 +27,26 @@ builder.Services.AddSingleton<DbProxyConfigProvider>();
 builder.Services.AddSingleton<IProxyConfigProvider>(sp => sp.GetRequiredService<DbProxyConfigProvider>());
 
 // ==============================
-// 3. Reverse Proxy + Controllers
+// 3. JWT Authentication
+// ==============================
+var jwtSecret = builder.Configuration["Jwt:Secret"] ?? "GatewaySecretKey-Change-This-In-Production-Min32Chars!";
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = builder.Configuration["Jwt:Issuer"] ?? "APIGateway",
+            ValidAudience = builder.Configuration["Jwt:Audience"] ?? "GatewayClients",
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret))
+        };
+    });
+
+// ==============================
+// 4. Reverse Proxy + Controllers
 // ==============================
 builder.Services.AddReverseProxy();
 builder.Services.AddControllers();
@@ -32,7 +54,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 // ==============================
-// 4. CORS
+// 5. CORS
 // ==============================
 builder.Services.AddCors(options =>
 {
@@ -49,7 +71,7 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 // ==============================
-// 5. Ensure database & seed
+// 6. Ensure database & seed
 // ==============================
 using (var scope = app.Services.CreateScope())
 {
@@ -61,7 +83,12 @@ using (var scope = app.Services.CreateScope())
         db.Clusters.Add(new Cluster
         {
             ClusterId = "default-cluster",
-            DestinationsJson = "[{\"id\":\"dest-1\",\"address\":\"http://localhost:5001\"}]"
+            DestinationsJson = "[{\"id\":\"dest-1\",\"address\":\"http://localhost:5001\",\"health\":\"Active\"},{\"id\":\"dest-2\",\"address\":\"http://localhost:5002\",\"health\":\"Standby\"}]",
+            EnableHealthCheck = true,
+            HealthCheckPath = "/health",
+            HealthCheckIntervalSeconds = 10,
+            HealthCheckTimeoutSeconds = 5,
+            LoadBalancingPolicy = "RoundRobin"
         });
     }
 
@@ -79,7 +106,7 @@ using (var scope = app.Services.CreateScope())
 }
 
 // ==============================
-// 6. Middleware pipeline
+// 7. Middleware pipeline
 // ==============================
 if (app.Environment.IsDevelopment())
 {
@@ -89,10 +116,16 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors("AllowAdminUI");
 
-// API key auth for admin endpoints
+// Metrics tracking (before auth, so we count all requests)
+app.UseMiddleware<MetricsMiddleware>();
+
+// JWT auth for proxy traffic
+app.UseAuthentication();
+app.UseAuthorization();
+
+// API key auth for admin endpoints only
 app.UseMiddleware<ApiKeyAuthMiddleware>();
 
-app.UseAuthorization();
 app.MapControllers();
 app.MapReverseProxy();
 app.Run();

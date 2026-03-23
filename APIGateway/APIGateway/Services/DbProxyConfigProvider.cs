@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Primitives;
 using System.Text.Json;
 using Yarp.ReverseProxy.Configuration;
+using Yarp.ReverseProxy.Health;
 
 namespace APIGateway.Services;
 
@@ -14,7 +15,6 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
     public DbProxyConfigProvider(IServiceScopeFactory scopeFactory)
     {
         _scopeFactory = scopeFactory;
-        // Load initial config; if DB not ready yet, start with empty config
         _currentConfig = LoadConfigFromDb();
         _timer = new Timer(_ => CheckForChanges(), null, 5000, 5000);
     }
@@ -35,10 +35,7 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
                 oldCts.Dispose();
             }
         }
-        catch
-        {
-            // DB might be temporarily unavailable
-        }
+        catch { /* DB temporarily unavailable */ }
     }
 
     private InMemoryConfig LoadConfigFromDb()
@@ -65,14 +62,50 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
 
             var clusterList = clusters.Select(c =>
             {
-                var dests = JsonSerializer.Deserialize<List<Destination>>(c.DestinationsJson) ?? [];
-                return new ClusterConfig
+                var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                var dests = JsonSerializer.Deserialize<List<DestinationDto>>(c.DestinationsJson, jsonOptions) ?? [];
+
+                var destinationConfigs = dests.ToDictionary(
+                    d => d.Id,
+                    d => new DestinationConfig
+                    {
+                        Address = d.Address,
+                        Health = d.Health ?? "Active" // "Active" or "Standby"
+                    });
+
+                var config = new ClusterConfig
                 {
                     ClusterId = c.ClusterId,
-                    Destinations = dests.ToDictionary(
-                        d => d.Id,
-                        d => new DestinationConfig { Address = d.Address })
+                    LoadBalancingPolicy = c.LoadBalancingPolicy ?? "RoundRobin",
+                    Destinations = destinationConfigs,
                 };
+
+                // Enable health checks if configured
+                if (c.EnableHealthCheck)
+                {
+                    config = config with
+                    {
+                        HealthCheck = new HealthCheckConfig
+                        {
+                            Active = new ActiveHealthCheckConfig
+                            {
+                                Enabled = true,
+                                Interval = TimeSpan.FromSeconds(c.HealthCheckIntervalSeconds > 0 ? c.HealthCheckIntervalSeconds : 10),
+                                Timeout = TimeSpan.FromSeconds(c.HealthCheckTimeoutSeconds > 0 ? c.HealthCheckTimeoutSeconds : 5),
+                                Path = c.HealthCheckPath ?? "/health",
+                                Policy = "ConsecutiveFailures"
+                            },
+                            Passive = new PassiveHealthCheckConfig
+                            {
+                                Enabled = true,
+                                Policy = "TransportFailureRate",
+                                ReactivationPeriod = TimeSpan.FromSeconds(30)
+                            }
+                        }
+                    };
+                }
+
+                return config;
             }).ToList();
 
             return new InMemoryConfig(
@@ -82,7 +115,6 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
         }
         catch
         {
-            // Return empty config if DB is not ready
             return new InMemoryConfig(
                 [],
                 [],
@@ -112,7 +144,7 @@ public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
         _changeTokenSource.Dispose();
     }
 
-    private record Destination(string Id, string Address);
+    private record DestinationDto(string Id, string Address, string? Health);
 
     private sealed class InMemoryConfig : IProxyConfig
     {

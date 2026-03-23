@@ -10,6 +10,10 @@ public class HealthController : ControllerBase
 {
     private readonly IRouteRepository _repo;
     private readonly DbProxyConfigProvider _provider;
+    private static readonly JsonSerializerOptions _jsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     public HealthController(IRouteRepository repo, DbProxyConfigProvider provider)
     {
@@ -29,8 +33,17 @@ public class HealthController : ControllerBase
             {
                 try
                 {
-                    var dests = JsonSerializer.Deserialize<List<DestInfo>>(c.DestinationsJson);
-                    return dests?.Select(d => new { c.ClusterId, d.Address }) ?? [];
+                    var dests = JsonSerializer.Deserialize<List<DestInfo>>(
+                        c.DestinationsJson, _jsonOptions);
+                    return dests?.Select(d => new
+                    {
+                        clusterId = c.ClusterId,
+                        address = d.Address ?? "",
+                        role = d.Health ?? "Active",
+                        healthCheck = c.EnableHealthCheck ? "Enabled" : "Disabled",
+                        healthCheckPath = c.HealthCheckPath,
+                        healthCheckIntervalSeconds = c.HealthCheckIntervalSeconds
+                    }) ?? [];
                 }
                 catch { return []; }
             })
@@ -52,5 +65,5 @@ public class HealthController : ControllerBase
         });
     }
 
-    private record DestInfo(string Id, string Address);
+    private record DestInfo(string Id, string Address, string? Health);
 }

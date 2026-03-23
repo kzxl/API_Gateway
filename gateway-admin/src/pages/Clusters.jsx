@@ -5,16 +5,27 @@ import {
   Modal,
   Form,
   Input,
+  InputNumber,
+  Switch,
+  Select,
   Popconfirm,
   Space,
   Tag,
   App,
   Typography,
+  Divider,
+  Card,
+  Row,
+  Col,
+  Tooltip,
 } from "antd";
 import {
   PlusOutlined,
   EditOutlined,
   DeleteOutlined,
+  HeartOutlined,
+  MinusCircleOutlined,
+  PlusCircleOutlined,
 } from "@ant-design/icons";
 import {
   getClusters,
@@ -23,7 +34,15 @@ import {
   deleteCluster,
 } from "../api/gatewayApi";
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
+
+const LB_POLICIES = [
+  { label: "Round Robin", value: "RoundRobin" },
+  { label: "Random", value: "Random" },
+  { label: "Least Requests", value: "LeastRequests" },
+  { label: "First Alphabetical", value: "FirstAlphabetical" },
+  { label: "Power of Two Choices", value: "PowerOfTwoChoices" },
+];
 
 export default function Clusters() {
   const { message } = App.useApp();
@@ -32,13 +51,19 @@ export default function Clusters() {
   const [editingId, setEditingId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm();
+  const [destinations, setDestinations] = useState([
+    { address: "", health: "Active" },
+  ]);
 
   const load = async () => {
     setLoading(true);
     try {
       setClusters((await getClusters()).data);
     } catch (err) {
-      message.error("Failed to load clusters: " + (err.response?.data?.error || err.message));
+      message.error(
+        "Failed to load clusters: " +
+          (err.response?.data?.error || err.message)
+      );
     } finally {
       setLoading(false);
     }
@@ -50,41 +75,81 @@ export default function Clusters() {
 
   const openCreate = () => {
     form.resetFields();
+    form.setFieldsValue({
+      enableHealthCheck: true,
+      healthCheckPath: "/health",
+      healthCheckIntervalSeconds: 10,
+      healthCheckTimeoutSeconds: 5,
+      loadBalancingPolicy: "RoundRobin",
+    });
+    setDestinations([{ address: "", health: "Active" }]);
     setEditingId(null);
     setOpen(true);
   };
 
   const openEdit = (record) => {
-    // Parse destinationsJson back to newline-separated addresses
-    let destinations = "";
+    let dests = [{ address: "", health: "Active" }];
     try {
-      const dests = JSON.parse(record.destinationsJson || "[]");
-      destinations = dests.map((d) => d.address).join("\n");
+      const parsed = JSON.parse(record.destinationsJson || "[]");
+      if (parsed.length > 0)
+        dests = parsed.map((d) => ({
+          address: d.address,
+          health: d.health || "Active",
+        }));
     } catch {
-      destinations = record.destinationsJson;
+      /* keep default */
     }
+    setDestinations(dests);
     form.setFieldsValue({
       clusterId: record.clusterId,
-      destinations,
+      enableHealthCheck: record.enableHealthCheck ?? true,
+      healthCheckPath: record.healthCheckPath || "/health",
+      healthCheckIntervalSeconds: record.healthCheckIntervalSeconds || 10,
+      healthCheckTimeoutSeconds: record.healthCheckTimeoutSeconds || 5,
+      loadBalancingPolicy: record.loadBalancingPolicy || "RoundRobin",
     });
     setEditingId(record.id);
     setOpen(true);
   };
 
+  const addDestination = () => {
+    setDestinations([...destinations, { address: "", health: "Active" }]);
+  };
+
+  const removeDestination = (index) => {
+    if (destinations.length <= 1) return;
+    setDestinations(destinations.filter((_, i) => i !== index));
+  };
+
+  const updateDestination = (index, field, value) => {
+    const newDests = [...destinations];
+    newDests[index] = { ...newDests[index], [field]: value };
+    setDestinations(newDests);
+  };
+
   const handleSubmit = async () => {
     try {
       const values = await form.validateFields();
-      const destList = (values.destinations || "")
-        .split("\n")
-        .filter((line) => line.trim())
-        .map((line, i) => ({
-          id: `dest-${i + 1}`,
-          address: line.trim(),
-        }));
+      const validDests = destinations.filter((d) => d.address.trim());
+      if (validDests.length === 0) {
+        message.error("At least one destination is required");
+        return;
+      }
+
+      const destList = validDests.map((d, i) => ({
+        id: `dest-${i + 1}`,
+        address: d.address.trim(),
+        health: d.health || "Active",
+      }));
 
       const payload = {
         clusterId: values.clusterId,
         destinationsJson: JSON.stringify(destList),
+        enableHealthCheck: values.enableHealthCheck ?? true,
+        healthCheckPath: values.healthCheckPath || "/health",
+        healthCheckIntervalSeconds: values.healthCheckIntervalSeconds || 10,
+        healthCheckTimeoutSeconds: values.healthCheckTimeoutSeconds || 5,
+        loadBalancingPolicy: values.loadBalancingPolicy || "RoundRobin",
       };
 
       if (editingId) {
@@ -113,13 +178,11 @@ export default function Clusters() {
     }
   };
 
-  // Parse destinations for display
   const parseDestinations = (json) => {
     try {
-      const dests = JSON.parse(json || "[]");
-      return dests.map((d) => d.address);
+      return JSON.parse(json || "[]");
     } catch {
-      return [json];
+      return [];
     }
   };
 
@@ -132,15 +195,42 @@ export default function Clusters() {
     {
       title: "Destinations",
       dataIndex: "destinationsJson",
-      render: (json) => (
-        <Space direction="vertical" size={2}>
-          {parseDestinations(json).map((addr, i) => (
-            <Tag key={i} color="cyan">
-              {addr}
-            </Tag>
-          ))}
+      render: (json) => {
+        const dests = parseDestinations(json);
+        return (
+          <Space direction="vertical" size={2}>
+            {dests.map((d, i) => (
+              <Space key={i} size={4}>
+                <Tag color={d.health === "Standby" ? "orange" : "cyan"}>
+                  {d.health === "Standby" ? "⏳ STANDBY" : "✅ PRIMARY"}
+                </Tag>
+                <Text>{d.address}</Text>
+              </Space>
+            ))}
+          </Space>
+        );
+      },
+    },
+    {
+      title: "Health Check",
+      render: (_, record) => (
+        <Space>
+          {record.enableHealthCheck ? (
+            <Tooltip title={`Path: ${record.healthCheckPath} · Every ${record.healthCheckIntervalSeconds}s`}>
+              <Tag icon={<HeartOutlined />} color="green">
+                ON
+              </Tag>
+            </Tooltip>
+          ) : (
+            <Tag color="default">OFF</Tag>
+          )}
         </Space>
       ),
+    },
+    {
+      title: "LB Policy",
+      dataIndex: "loadBalancingPolicy",
+      render: (v) => <Tag>{v || "RoundRobin"}</Tag>,
     },
     {
       title: "Actions",
@@ -166,7 +256,13 @@ export default function Clusters() {
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          marginBottom: 16,
+        }}
+      >
         <Title level={3} style={{ margin: 0 }}>
           Clusters
         </Title>
@@ -190,6 +286,7 @@ export default function Clusters() {
         onCancel={() => setOpen(false)}
         onOk={handleSubmit}
         okText={editingId ? "Update" : "Create"}
+        width={640}
         destroyOnClose
       >
         <Form form={form} layout="vertical">
@@ -200,15 +297,96 @@ export default function Clusters() {
           >
             <Input placeholder="e.g. user-service-cluster" />
           </Form.Item>
-          <Form.Item
-            name="destinations"
-            label="Destinations (one address per line)"
-            rules={[{ required: true, message: "At least one destination" }]}
+
+          {/* ── Destinations ── */}
+          <Divider orientation="left" plain>
+            Destinations (Primary + Failover)
+          </Divider>
+
+          {destinations.map((dest, index) => (
+            <Row key={index} gutter={8} style={{ marginBottom: 8 }}>
+              <Col flex="auto">
+                <Input
+                  placeholder="http://localhost:5001"
+                  value={dest.address}
+                  onChange={(e) =>
+                    updateDestination(index, "address", e.target.value)
+                  }
+                />
+              </Col>
+              <Col>
+                <Select
+                  value={dest.health}
+                  onChange={(v) => updateDestination(index, "health", v)}
+                  style={{ width: 120 }}
+                  options={[
+                    { label: "✅ Primary", value: "Active" },
+                    { label: "⏳ Standby", value: "Standby" },
+                  ]}
+                />
+              </Col>
+              <Col>
+                <Button
+                  type="text"
+                  danger
+                  icon={<MinusCircleOutlined />}
+                  disabled={destinations.length <= 1}
+                  onClick={() => removeDestination(index)}
+                />
+              </Col>
+            </Row>
+          ))}
+
+          <Button
+            type="dashed"
+            block
+            icon={<PlusCircleOutlined />}
+            onClick={addDestination}
+            style={{ marginBottom: 16 }}
           >
-            <Input.TextArea
-              rows={4}
-              placeholder={"http://localhost:5001\nhttp://localhost:5002"}
-            />
+            Add Destination
+          </Button>
+
+          {/* ── Health Check ── */}
+          <Divider orientation="left" plain>
+            Health Check (Failover)
+          </Divider>
+          <Card size="small" style={{ marginBottom: 16 }}>
+            <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
+              Khi bật Health Check, gateway sẽ tự động probe các destinations. Nếu primary bị
+              down, traffic tự động chuyển sang standby.
+            </Text>
+            <Row gutter={16}>
+              <Col span={6}>
+                <Form.Item
+                  name="enableHealthCheck"
+                  label="Enable"
+                  valuePropName="checked"
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+              <Col span={6}>
+                <Form.Item name="healthCheckPath" label="Path">
+                  <Input placeholder="/health" />
+                </Form.Item>
+              </Col>
+              <Col span={6}>
+                <Form.Item name="healthCheckIntervalSeconds" label="Interval (s)">
+                  <InputNumber min={1} max={300} style={{ width: "100%" }} />
+                </Form.Item>
+              </Col>
+              <Col span={6}>
+                <Form.Item name="healthCheckTimeoutSeconds" label="Timeout (s)">
+                  <InputNumber min={1} max={60} style={{ width: "100%" }} />
+                </Form.Item>
+              </Col>
+            </Row>
+          </Card>
+
+          {/* ── Load Balancing ── */}
+          <Form.Item name="loadBalancingPolicy" label="Load Balancing Policy">
+            <Select options={LB_POLICIES} />
           </Form.Item>
         </Form>
       </Modal>

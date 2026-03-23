@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from "react";
-import { Row, Col, Card, Statistic, Tag, Table, Spin, Typography, Space } from "antd";
+import { Row, Col, Card, Statistic, Tag, Table, Spin, Typography, Space, Tooltip } from "antd";
 import {
   ApiOutlined,
   ClusterOutlined,
   NodeIndexOutlined,
   CheckCircleOutlined,
+  HeartOutlined,
 } from "@ant-design/icons";
 import { getHealth } from "../api/gatewayApi";
 
@@ -30,7 +31,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     load();
-    const timer = setInterval(load, 10000); // auto refresh 10s
+    const timer = setInterval(load, 10000);
     return () => clearInterval(timer);
   }, []);
 
@@ -52,6 +53,9 @@ export default function Dashboard() {
 
   const gw = health?.gateway || {};
   const destinations = health?.destinations || [];
+
+  const primaryCount = destinations.filter((d) => d.role === "Active").length;
+  const standbyCount = destinations.filter((d) => d.role === "Standby").length;
 
   return (
     <div>
@@ -77,7 +81,7 @@ export default function Dashboard() {
         <Col xs={24} sm={12} lg={6}>
           <Card hoverable>
             <Statistic
-              title="Active Clusters"
+              title="Clusters"
               value={gw.totalClusters}
               prefix={<ClusterOutlined style={{ color: "#52c41a" }} />}
             />
@@ -86,8 +90,15 @@ export default function Dashboard() {
         <Col xs={24} sm={12} lg={6}>
           <Card hoverable>
             <Statistic
-              title="Destinations"
-              value={gw.totalDestinations}
+              title="Primary APIs"
+              value={primaryCount}
+              suffix={
+                standbyCount > 0 ? (
+                  <Text type="secondary" style={{ fontSize: 14 }}>
+                    + {standbyCount} standby
+                  </Text>
+                ) : null
+              }
               prefix={<NodeIndexOutlined style={{ color: "#fa8c16" }} />}
             />
           </Card>
@@ -123,6 +134,32 @@ export default function Dashboard() {
                   {v}
                 </a>
               ),
+            },
+            {
+              title: "Role",
+              dataIndex: "role",
+              render: (v) =>
+                v === "Standby" ? (
+                  <Tooltip title="Sẽ tự động nhận traffic khi primary down">
+                    <Tag color="orange">⏳ STANDBY</Tag>
+                  </Tooltip>
+                ) : (
+                  <Tag color="green">✅ PRIMARY</Tag>
+                ),
+            },
+            {
+              title: "Health Check",
+              dataIndex: "healthCheck",
+              render: (v, record) =>
+                v === "Enabled" ? (
+                  <Tooltip title={`Path: ${record.healthCheckPath} · Every ${record.healthCheckIntervalSeconds}s`}>
+                    <Tag icon={<HeartOutlined />} color="green">
+                      ON
+                    </Tag>
+                  </Tooltip>
+                ) : (
+                  <Tag color="default">OFF</Tag>
+                ),
             },
           ]}
         />

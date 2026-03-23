@@ -8,6 +8,14 @@ const api = axios.create({
   headers: { "X-Api-Key": API_KEY },
 });
 
+// ── Auth (public, no API key needed) ──
+const publicApi = axios.create({ baseURL: API_BASE });
+
+export const login = (username, password) =>
+  publicApi.post("/auth/login", { username, password });
+export const validateToken = (token) =>
+  publicApi.post("/auth/validate", { token });
+
 // ── Routes ──
 export const getRoutes = () => api.get("/admin/routes");
 export const getRouteById = (id) => api.get(`/admin/routes/${id}`);
@@ -25,3 +33,7 @@ export const deleteCluster = (id) => api.delete(`/admin/clusters/${id}`);
 
 // ── Health ──
 export const getHealth = () => api.get("/admin/health");
+
+// ── Metrics ──
+export const getMetrics = () => api.get("/admin/metrics");
+export const resetMetrics = () => api.delete("/admin/metrics");

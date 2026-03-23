@@ -11,10 +11,12 @@ import {
   DashboardOutlined,
   ApiOutlined,
   ClusterOutlined,
+  BarChartOutlined,
 } from "@ant-design/icons";
 import Dashboard from "./pages/Dashboard";
 import RoutesPage from "./pages/Routes";
 import ClustersPage from "./pages/Clusters";
+import MetricsPage from "./pages/Metrics";
 import "./App.css";
 
 const { Sider, Content } = Layout;
@@ -35,6 +37,11 @@ const menuItems = [
     key: "/clusters",
     icon: <ClusterOutlined />,
     label: <Link to="/clusters">Clusters</Link>,
+  },
+  {
+    key: "/metrics",
+    icon: <BarChartOutlined />,
+    label: <Link to="/metrics">Traffic</Link>,
   },
 ];
 
@@ -73,6 +80,7 @@ function AppLayout() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/routes" element={<RoutesPage />} />
             <Route path="/clusters" element={<ClustersPage />} />
+            <Route path="/metrics" element={<MetricsPage />} />
           </Routes>
         </Content>
       </Layout>
