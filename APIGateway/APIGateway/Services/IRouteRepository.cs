@@ -1,13 +1,18 @@
-﻿using APIGateway.Models;
+using APIGateway.Models;
 
-namespace APIGateway.Services
+namespace APIGateway.Services;
+
+public interface IRouteRepository
 {
-    public interface IRouteRepository
-    {
-        Task<List<Models.Route>> GetRoutesAsync();
-        Task<List<Cluster>> GetClustersAsync();
-        Task AddOrUpdateRouteAsync(Models.Route r);
-        Task DeleteRouteAsync(int id);
-        Task AddOrUpdateClusterAsync(Cluster c);
-    }
+    // Routes
+    Task<List<Models.Route>> GetRoutesAsync();
+    Task<Models.Route?> GetRouteByIdAsync(int id);
+    Task AddOrUpdateRouteAsync(Models.Route r);
+    Task DeleteRouteAsync(int id);
+
+    // Clusters
+    Task<List<Cluster>> GetClustersAsync();
+    Task<Cluster?> GetClusterByIdAsync(int id);
+    Task AddOrUpdateClusterAsync(Cluster c);
+    Task DeleteClusterAsync(int id);
 }

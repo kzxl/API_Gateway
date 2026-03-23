@@ -1,37 +1,49 @@
-﻿using Microsoft.Extensions.Primitives;
+using Microsoft.Extensions.Primitives;
 using System.Text.Json;
 using Yarp.ReverseProxy.Configuration;
 
-namespace APIGateway.Services
+namespace APIGateway.Services;
+
+public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
 {
-    public class DbProxyConfigProvider : IProxyConfigProvider, IDisposable
+    private volatile InMemoryConfig _currentConfig;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly Timer _timer;
+    private CancellationTokenSource _changeTokenSource = new();
+
+    public DbProxyConfigProvider(IServiceScopeFactory scopeFactory)
     {
-        private volatile InMemoryConfig _currentConfig;
-        private readonly IServiceScopeFactory _scopeFactory;
-        private readonly Timer _timer;
-        private CancellationTokenSource _changeTokenSource = new();
+        _scopeFactory = scopeFactory;
+        // Load initial config; if DB not ready yet, start with empty config
+        _currentConfig = LoadConfigFromDb();
+        _timer = new Timer(_ => CheckForChanges(), null, 5000, 5000);
+    }
 
-        public DbProxyConfigProvider(IServiceScopeFactory scopeFactory)
-        {
-            _scopeFactory = scopeFactory;
-            _currentConfig = LoadConfigFromDb();
-            _timer = new Timer(_ => CheckForChanges(), null, 5000, 5000);
-        }
+    public IProxyConfig GetConfig() => _currentConfig;
 
-        public IProxyConfig GetConfig() => _currentConfig;
-
-        private void CheckForChanges()
+    private void CheckForChanges()
+    {
+        try
         {
             var newCfg = LoadConfigFromDb();
             if (!ProxyConfigEquals(_currentConfig, newCfg))
             {
-                _changeTokenSource.Cancel();
+                var oldCts = _changeTokenSource;
                 _changeTokenSource = new CancellationTokenSource();
                 _currentConfig = newCfg;
+                oldCts.Cancel();
+                oldCts.Dispose();
             }
         }
+        catch
+        {
+            // DB might be temporarily unavailable
+        }
+    }
 
-        private InMemoryConfig LoadConfigFromDb()
+    private InMemoryConfig LoadConfigFromDb()
+    {
+        try
         {
             using var scope = _scopeFactory.CreateScope();
             var repo = scope.ServiceProvider.GetRequiredService<IRouteRepository>();
@@ -53,51 +65,69 @@ namespace APIGateway.Services
 
             var clusterList = clusters.Select(c =>
             {
-                var dests = JsonSerializer.Deserialize<List<Destination>>(c.DestinationsJson) ?? new();
+                var dests = JsonSerializer.Deserialize<List<Destination>>(c.DestinationsJson) ?? [];
                 return new ClusterConfig
                 {
                     ClusterId = c.ClusterId,
-                    Destinations = dests.ToDictionary(d => d.Id, d => new DestinationConfig { Address = d.Address })
+                    Destinations = dests.ToDictionary(
+                        d => d.Id,
+                        d => new DestinationConfig { Address = d.Address })
                 };
             }).ToList();
 
-            return new InMemoryConfig(routeConfigs, clusterList, new CancellationChangeToken(_changeTokenSource.Token));
-
+            return new InMemoryConfig(
+                routeConfigs,
+                clusterList,
+                new CancellationChangeToken(_changeTokenSource.Token));
         }
-
-        private bool ProxyConfigEquals(InMemoryConfig a, InMemoryConfig b)
+        catch
         {
-            if (a == null || b == null) return false;
-            return JsonSerializer.Serialize(a) == JsonSerializer.Serialize(b);
+            // Return empty config if DB is not ready
+            return new InMemoryConfig(
+                [],
+                [],
+                new CancellationChangeToken(_changeTokenSource.Token));
         }
+    }
 
-        public void ForceReload()
+    private bool ProxyConfigEquals(InMemoryConfig a, InMemoryConfig b)
+    {
+        if (a == null || b == null) return false;
+        return JsonSerializer.Serialize(a.Routes) == JsonSerializer.Serialize(b.Routes)
+            && JsonSerializer.Serialize(a.Clusters) == JsonSerializer.Serialize(b.Clusters);
+    }
+
+    public void ForceReload()
+    {
+        var oldCts = _changeTokenSource;
+        _changeTokenSource = new CancellationTokenSource();
+        _currentConfig = LoadConfigFromDb();
+        oldCts.Cancel();
+        oldCts.Dispose();
+    }
+
+    public void Dispose()
+    {
+        _timer.Dispose();
+        _changeTokenSource.Dispose();
+    }
+
+    private record Destination(string Id, string Address);
+
+    private sealed class InMemoryConfig : IProxyConfig
+    {
+        public InMemoryConfig(
+            IReadOnlyList<RouteConfig> routes,
+            IReadOnlyList<ClusterConfig> clusters,
+            IChangeToken token)
         {
-            _changeTokenSource.Cancel();
-            _changeTokenSource = new CancellationTokenSource();
-            _currentConfig = LoadConfigFromDb();
+            Routes = routes;
+            Clusters = clusters;
+            ChangeToken = token;
         }
 
-        public void Dispose()
-        {
-            _timer.Dispose();
-            _changeTokenSource.Dispose();
-        }
-
-        private record Destination(string Id, string Address);
-
-        private sealed class InMemoryConfig : IProxyConfig
-        {
-            public InMemoryConfig(IReadOnlyList<RouteConfig> routes, IReadOnlyList<ClusterConfig> clusters, IChangeToken token)
-            {
-                Routes = routes;
-                Clusters = clusters;
-                ChangeToken = token;
-            }
-
-            public IReadOnlyList<RouteConfig> Routes { get; }
-            public IReadOnlyList<ClusterConfig> Clusters { get; }
-            public IChangeToken ChangeToken { get; }
-        }
+        public IReadOnlyList<RouteConfig> Routes { get; }
+        public IReadOnlyList<ClusterConfig> Clusters { get; }
+        public IChangeToken ChangeToken { get; }
     }
 }

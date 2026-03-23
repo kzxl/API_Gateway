@@ -35,6 +35,8 @@ project.assets.json
 *.orig
 *.cache
 *.db
+*.db-shm
+*.db-wal
 
 # === Optional: Ignore publish folders if you publish manually ===
 **/PublishOutput/

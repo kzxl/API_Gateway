@@ -1,13 +1,27 @@
 import axios from "axios";
 
+const API_BASE = "http://localhost:5151";
+const API_KEY = "gw-admin-key-change-me";
+
 const api = axios.create({
-  baseURL: "http://localhost:5000/api/gateway", // trỏ tới backend .NET
+  baseURL: API_BASE,
+  headers: { "X-Api-Key": API_KEY },
 });
 
-export const getRoutes = () => api.get("/routes");
-export const saveRoute = (data) => api.post("/routes", data);
-export const deleteRoute = (id) => api.delete(`/routes/${id}`);
+// ── Routes ──
+export const getRoutes = () => api.get("/admin/routes");
+export const getRouteById = (id) => api.get(`/admin/routes/${id}`);
+export const createRoute = (data) => api.post("/admin/routes", data);
+export const updateRoute = (id, data) => api.put(`/admin/routes/${id}`, data);
+export const deleteRoute = (id) => api.delete(`/admin/routes/${id}`);
 
-export const getClusters = () => api.get("/clusters");
-export const saveCluster = (data) => api.post("/clusters", data);
-export const deleteCluster = (id) => api.delete(`/clusters/${id}`);
+// ── Clusters ──
+export const getClusters = () => api.get("/admin/clusters");
+export const getClusterById = (id) => api.get(`/admin/clusters/${id}`);
+export const createCluster = (data) => api.post("/admin/clusters", data);
+export const updateCluster = (id, data) =>
+  api.put(`/admin/clusters/${id}`, data);
+export const deleteCluster = (id) => api.delete(`/admin/clusters/${id}`);
+
+// ── Health ──
+export const getHealth = () => api.get("/admin/health");

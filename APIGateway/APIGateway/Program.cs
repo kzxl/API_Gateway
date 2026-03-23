@@ -1,45 +1,61 @@
-﻿using APIGateway.Data;
+using APIGateway.Data;
+using APIGateway.Middleware;
 using APIGateway.Models;
 using APIGateway.Services;
 using Microsoft.EntityFrameworkCore;
-using System.Diagnostics.Metrics;
 using Yarp.ReverseProxy.Configuration;
-
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ==============================
-// 1️  Configure Database
+// 1. Database
 // ==============================
+var connectionString = builder.Configuration.GetConnectionString("GatewayDb")
+                      ?? "Data Source=gateway.db";
+
 builder.Services.AddDbContext<GatewayDbContext>(opt =>
-    opt.UseSqlite("Data Source=gateway.db"));
+    opt.UseSqlite(connectionString));
 
 // ==============================
-// 2️  Repository + Proxy Provider
+// 2. Repository + Proxy Provider
 // ==============================
 builder.Services.AddScoped<IRouteRepository, RouteRepository>();
 builder.Services.AddSingleton<DbProxyConfigProvider>();
 builder.Services.AddSingleton<IProxyConfigProvider>(sp => sp.GetRequiredService<DbProxyConfigProvider>());
 
 // ==============================
-// 3️  Reverse Proxy + Controllers
+// 3. Reverse Proxy + Controllers
 // ==============================
 builder.Services.AddReverseProxy();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// ==============================
+// 4. CORS
+// ==============================
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAdminUI", policy =>
+    {
+        policy.WithOrigins(
+                "http://localhost:5173",
+                "http://localhost:3000")
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
 var app = builder.Build();
 
 // ==============================
-// 4️  Ensure database and seed default data
+// 5. Ensure database & seed
 // ==============================
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
     db.Database.EnsureCreated();
 
-    // Dữ liệu mẫu nếu chưa có
     if (!db.Clusters.Any())
     {
         db.Clusters.Add(new Cluster
@@ -63,7 +79,7 @@ using (var scope = app.Services.CreateScope())
 }
 
 // ==============================
-// 5️  Middleware pipeline
+// 6. Middleware pipeline
 // ==============================
 if (app.Environment.IsDevelopment())
 {
@@ -71,9 +87,10 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// Nếu backend của bạn không có HTTPS hoặc là localhost
-// bạn có thể comment dòng dưới để tránh lỗi HTTPS connect
-// app.UseHttpsRedirection();
+app.UseCors("AllowAdminUI");
+
+// API key auth for admin endpoints
+app.UseMiddleware<ApiKeyAuthMiddleware>();
 
 app.UseAuthorization();
 app.MapControllers();
