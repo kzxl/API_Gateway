@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Json;
+using System.Threading.RateLimiting;
 using APIGateway.Data;
 using APIGateway.Models;
 using Microsoft.EntityFrameworkCore;
@@ -21,14 +22,20 @@ public class GatewayProtectionMiddleware
     // GoFlow Engine Client
     private static readonly HttpClient _goFlowClient = new() { BaseAddress = new Uri("http://127.0.0.1:50051") };
 
-    // ── Circuit Breaker: per routeId ──
+    // ── Pre-allocated States ──
     private static readonly ConcurrentDictionary<string, CircuitState> _circuits = new();
+    private static readonly ConcurrentDictionary<string, TokenBucketRateLimiter> _rateLimiters = new();
+    private static readonly ConcurrentQueue<RequestLog> _logQueue = new();
+    private static Timer? _flushTimer;
 
     public GatewayProtectionMiddleware(RequestDelegate next, IMemoryCache cache, IServiceScopeFactory scopeFactory)
     {
         _next = next;
         _cache = cache;
         _scopeFactory = scopeFactory;
+        
+        // Start background flusher for logs to GoFlow Engine (Batching)
+        _flushTimer ??= new Timer(FlushLogsToGoFlow, null, 3000, 3000);
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -43,16 +50,29 @@ public class GatewayProtectionMiddleware
         // ── 1. Resolve route config from Memory Cache (No DB hit) ──
         if (!_cache.TryGetValue("GatewayRoutes", out List<Models.Route>? routes) || routes == null)
         {
-            using var scope = _scopeFactory.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
-            routes = await db.Routes.ToListAsync();
-            _cache.Set("GatewayRoutes", routes, TimeSpan.FromMinutes(5));
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+                routes = await db.Routes.AsNoTracking().ToListAsync();
+                _cache.Set("GatewayRoutes", routes, TimeSpan.FromMinutes(5));
+            }
+            catch { routes = new List<Models.Route>(); }
         }
 
-        // Find best matching route
-        var routeConfig = routes.FirstOrDefault(r =>
-            path.StartsWith(r.MatchPath.Replace("/{**catch-all}", "").Replace("{**catch-all}", ""))
-            || r.MatchPath == "/{**catch-all}");
+        // Find best matching route without allocating new strings
+        var routeConfig = routes!.FirstOrDefault(r =>
+        {
+            if (r.MatchPath == "/{**catch-all}") return true;
+            
+            var matchPath = r.MatchPath.AsSpan();
+            if (matchPath.EndsWith("/{**catch-all}"))
+                matchPath = matchPath[..^15];
+            else if (matchPath.EndsWith("{**catch-all}"))
+                matchPath = matchPath[..^14];
+
+            return path.AsSpan().StartsWith(matchPath);
+        });
 
         var clientIp = context.Connection.RemoteIpAddress?.ToString() ?? "127.0.0.1";
         var routeId = routeConfig?.RouteId ?? "unknown";
@@ -80,38 +100,31 @@ public class GatewayProtectionMiddleware
             }
         }
 
-        // ── 3. Rate Limiting (via GoFlow Engine) ──
+        // ── 3. Rate Limiting (In-Memory .NET 8 TokenBucket) ──
+        // Extremely fast nano-second check, removes HTTP overhead per request!
         if (routeConfig != null && routeConfig.RateLimitPerSecond > 0)
         {
-            try
+            var key = $"{routeId}:{clientIp}";
+            var limiter = _rateLimiters.GetOrAdd(key, _ => new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
             {
-                var response = await _goFlowClient.PostAsJsonAsync("/ratelimit", new
-                {
-                    routeId = routeId,
-                    ip = clientIp,
-                    limitPerSec = routeConfig.RateLimitPerSecond
-                });
+                TokenLimit = routeConfig.RateLimitPerSecond,
+                TokensPerPeriod = routeConfig.RateLimitPerSecond,
+                ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+                AutoReplenishment = true
+            }));
 
-                if (response.IsSuccessStatusCode)
-                {
-                    var result = await response.Content.ReadFromJsonAsync<RateLimitResponse>();
-                    if (result != null && !result.Allowed)
-                    {
-                        context.Response.StatusCode = 429;
-                        context.Response.Headers["Retry-After"] = "1";
-                        await context.Response.WriteAsJsonAsync(new
-                        {
-                            error = "Too many requests",
-                            retryAfter = 1,
-                            limit = routeConfig.RateLimitPerSecond
-                        });
-                        return;
-                    }
-                }
-            }
-            catch
+            using var lease = limiter.AttemptAcquire(1);
+            if (!lease.IsAcquired)
             {
-                // Fallback / fail-open if GoFlow is down
+                context.Response.StatusCode = 429;
+                context.Response.Headers["Retry-After"] = "1";
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    error = "Too many requests",
+                    retryAfter = 1,
+                    limit = routeConfig.RateLimitPerSecond
+                });
+                return;
             }
         }
 
@@ -158,38 +171,61 @@ public class GatewayProtectionMiddleware
                 if (circuit.GetErrorRate() >= routeConfig.CircuitBreakerThreshold)
                     circuit.Trip();
             }
-            // Send error log to GoFlow before throwing
-            FireAndForgetLog(context, path, 500, sw.ElapsedMilliseconds, clientIp, routeId);
+            EnqueueLog(context, path, 500, sw.ElapsedMilliseconds, clientIp, routeId);
             throw;
         }
 
-        // ── 5. Log request (via GoFlow Engine) ──
-        FireAndForgetLog(context, path, context.Response.StatusCode, sw.ElapsedMilliseconds, clientIp, routeId);
+        // ── 5. Log request (Enqueue for GoFlow Batching) ──
+        EnqueueLog(context, path, context.Response.StatusCode, sw.ElapsedMilliseconds, clientIp, routeId);
     }
 
-    private void FireAndForgetLog(HttpContext context, string path, int statusCode, long latencyMs, string clientIp, string routeId)
+    private void EnqueueLog(HttpContext context, string path, int statusCode, long latencyMs, string clientIp, string routeId)
     {
-        var logReq = new
+        _logQueue.Enqueue(new RequestLog
         {
-            timestamp = DateTime.UtcNow.ToString("O"),
-            method = context.Request.Method,
-            path = path,
-            statusCode = statusCode,
-            latencyMs = latencyMs,
-            clientIp = clientIp,
-            routeId = routeId,
-            userAgent = context.Request.Headers.UserAgent.FirstOrDefault() ?? ""
-        };
-
-        // Fire and forget HTTP POST to GoFlow (no await)
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _goFlowClient.PostAsJsonAsync("/log", logReq);
-            }
-            catch { /* Ignore logging errors */ }
+            Timestamp = DateTime.UtcNow,
+            Method = context.Request.Method,
+            Path = path,
+            StatusCode = statusCode,
+            LatencyMs = latencyMs,
+            ClientIp = clientIp,
+            RouteId = routeId,
+            UserAgent = context.Request.Headers.UserAgent.FirstOrDefault() ?? ""
         });
+    }
+
+    private static void FlushLogsToGoFlow(object? state)
+    {
+        if (_logQueue.IsEmpty) return;
+
+        var logs = new List<object>();
+        while (_logQueue.TryDequeue(out var log) && logs.Count < 5000)
+        {
+            logs.Add(new
+            {
+                timestamp = log.Timestamp.ToString("O"),
+                method = log.Method,
+                path = log.Path,
+                statusCode = log.StatusCode,
+                latencyMs = log.LatencyMs,
+                clientIp = log.ClientIp,
+                routeId = log.RouteId,
+                userAgent = log.UserAgent
+            });
+        }
+
+        if (logs.Count > 0)
+        {
+            // Send bulk batch to GoFlow engine (reduces HTTP calls by 5000x)
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _goFlowClient.PostAsJsonAsync("/log/batch", logs);
+                }
+                catch { /* Ignore if GoFlow is down */ }
+            });
+        }
     }
 
     // ── Circuit Breaker state tracking ──
@@ -201,11 +237,6 @@ public class GatewayProtectionMiddleware
             errorRate = kv.Value.GetErrorRate(),
             totalRequests = kv.Value.TotalRequests
         });
-    }
-
-    private class RateLimitResponse
-    {
-        public bool Allowed { get; set; }
     }
 }
 
