@@ -1,5 +1,5 @@
-using APIGateway.Models;
-using APIGateway.Services;
+using APIGateway.Core.Interfaces;
+using APIGateway.Core.Interfaces.DTOs;
 using Microsoft.AspNetCore.Mvc;
 
 namespace APIGateway.Controllers;
@@ -8,62 +8,32 @@ namespace APIGateway.Controllers;
 [Route("admin/clusters")]
 public class AdminClustersController : ControllerBase
 {
-    private readonly IRouteRepository _repo;
-    private readonly DbProxyConfigProvider _provider;
+    private readonly IClusterService _service;
 
-    public AdminClustersController(IRouteRepository repo, DbProxyConfigProvider provider)
-    {
-        _repo = repo;
-        _provider = provider;
-    }
+    public AdminClustersController(IClusterService service) => _service = service;
 
     [HttpGet]
-    public async Task<IActionResult> GetAll()
-    {
-        var clusters = await _repo.GetClustersAsync();
-        return Ok(clusters);
-    }
+    public async Task<IActionResult> GetAll() => Ok(await _service.GetAllAsync());
 
-    [HttpGet("{id:int}")]
+    [HttpGet("{id}")]
     public async Task<IActionResult> GetById(int id)
     {
-        var cluster = await _repo.GetClusterByIdAsync(id);
-        return cluster is null ? NotFound() : Ok(cluster);
+        var cluster = await _service.GetByIdAsync(id);
+        return cluster == null ? NotFound(new { error = "Cluster not found" }) : Ok(cluster);
     }
 
     [HttpPost]
-    public async Task<IActionResult> Create([FromBody] Cluster dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.ClusterId))
-            return BadRequest(new { error = "ClusterId is required" });
-        if (string.IsNullOrWhiteSpace(dto.DestinationsJson))
-            return BadRequest(new { error = "DestinationsJson is required" });
+    public async Task<IActionResult> Create([FromBody] CreateClusterDto dto) =>
+        Ok(await _service.CreateAsync(dto));
 
-        dto.Id = 0;
-        await _repo.AddOrUpdateClusterAsync(dto);
-        _provider.ForceReload();
-        return CreatedAtAction(nameof(GetById), new { id = dto.Id }, dto);
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(int id, [FromBody] CreateClusterDto dto)
+    {
+        var result = await _service.UpdateAsync(id, dto);
+        return result == null ? NotFound(new { error = "Cluster not found" }) : Ok(result);
     }
 
-    [HttpPut("{id:int}")]
-    public async Task<IActionResult> Update(int id, [FromBody] Cluster dto)
-    {
-        var existing = await _repo.GetClusterByIdAsync(id);
-        if (existing is null) return NotFound();
-
-        existing.ClusterId = dto.ClusterId;
-        existing.DestinationsJson = dto.DestinationsJson;
-
-        await _repo.AddOrUpdateClusterAsync(existing);
-        _provider.ForceReload();
-        return Ok(existing);
-    }
-
-    [HttpDelete("{id:int}")]
-    public async Task<IActionResult> Delete(int id)
-    {
-        await _repo.DeleteClusterAsync(id);
-        _provider.ForceReload();
-        return NoContent();
-    }
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id) =>
+        await _service.DeleteAsync(id) ? Ok(new { message = "Cluster deleted" }) : NotFound(new { error = "Cluster not found" });
 }

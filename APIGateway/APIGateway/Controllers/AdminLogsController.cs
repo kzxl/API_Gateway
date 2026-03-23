@@ -1,6 +1,5 @@
-using APIGateway.Data;
+using APIGateway.Core.Interfaces;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
 
 namespace APIGateway.Controllers;
 
@@ -8,9 +7,9 @@ namespace APIGateway.Controllers;
 [Route("admin/logs")]
 public class AdminLogsController : ControllerBase
 {
-    private readonly GatewayDbContext _db;
+    private readonly ILogService _service;
 
-    public AdminLogsController(GatewayDbContext db) => _db = db;
+    public AdminLogsController(ILogService service) => _service = service;
 
     [HttpGet]
     public async Task<IActionResult> GetLogs(
@@ -18,54 +17,16 @@ public class AdminLogsController : ControllerBase
         [FromQuery] int pageSize = 50,
         [FromQuery] string? routeId = null,
         [FromQuery] int? statusCode = null,
-        [FromQuery] string? method = null)
-    {
-        var query = _db.RequestLogs.AsQueryable();
-
-        if (!string.IsNullOrWhiteSpace(routeId))
-            query = query.Where(l => l.RouteId == routeId);
-        if (statusCode.HasValue)
-            query = query.Where(l => l.StatusCode == statusCode.Value);
-        if (!string.IsNullOrWhiteSpace(method))
-            query = query.Where(l => l.Method == method.ToUpper());
-
-        var total = await query.CountAsync();
-        var logs = await query
-            .OrderByDescending(l => l.Timestamp)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .ToListAsync();
-
-        return Ok(new { total, page, pageSize, logs });
-    }
+        [FromQuery] string? method = null) =>
+        Ok(await _service.GetLogsAsync(page, pageSize, routeId, statusCode, method));
 
     [HttpDelete]
     public async Task<IActionResult> ClearLogs()
     {
-        await _db.RequestLogs.ExecuteDeleteAsync();
+        await _service.ClearAsync();
         return Ok(new { message = "Logs cleared" });
     }
 
     [HttpGet("stats")]
-    public async Task<IActionResult> GetStats()
-    {
-        var total = await _db.RequestLogs.CountAsync();
-        var last24h = await _db.RequestLogs
-            .Where(l => l.Timestamp > DateTime.UtcNow.AddHours(-24))
-            .CountAsync();
-
-        var byStatus = await _db.RequestLogs
-            .GroupBy(l => l.StatusCode / 100)
-            .Select(g => new { StatusGroup = g.Key + "xx", Count = g.Count() })
-            .ToListAsync();
-
-        var topRoutes = await _db.RequestLogs
-            .GroupBy(l => l.RouteId)
-            .Select(g => new { RouteId = g.Key, Count = g.Count(), AvgLatency = g.Average(l => l.LatencyMs) })
-            .OrderByDescending(x => x.Count)
-            .Take(10)
-            .ToListAsync();
-
-        return Ok(new { total, last24h, byStatus, topRoutes });
-    }
+    public async Task<IActionResult> GetStats() => Ok(await _service.GetStatsAsync());
 }

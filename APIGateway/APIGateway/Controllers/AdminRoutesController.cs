@@ -1,73 +1,43 @@
-using APIGateway.Models;
-using APIGateway.Services;
+using APIGateway.Core.Interfaces;
+using APIGateway.Core.Interfaces.DTOs;
 using Microsoft.AspNetCore.Mvc;
 
 namespace APIGateway.Controllers;
 
+/// <summary>
+/// Routes CRUD — thin wrapper over IRouteService.
+/// UArch: Controller is adapter, Service is brain.
+/// </summary>
 [ApiController]
 [Route("admin/routes")]
 public class AdminRoutesController : ControllerBase
 {
-    private readonly IRouteRepository _repo;
-    private readonly DbProxyConfigProvider _provider;
+    private readonly IRouteService _service;
 
-    public AdminRoutesController(IRouteRepository repo, DbProxyConfigProvider provider)
-    {
-        _repo = repo;
-        _provider = provider;
-    }
+    public AdminRoutesController(IRouteService service) => _service = service;
 
     [HttpGet]
-    public async Task<IActionResult> GetAll()
-    {
-        var routes = await _repo.GetRoutesAsync();
-        return Ok(routes);
-    }
+    public async Task<IActionResult> GetAll() => Ok(await _service.GetAllAsync());
 
-    [HttpGet("{id:int}")]
+    [HttpGet("{id}")]
     public async Task<IActionResult> GetById(int id)
     {
-        var route = await _repo.GetRouteByIdAsync(id);
-        return route is null ? NotFound() : Ok(route);
+        var route = await _service.GetByIdAsync(id);
+        return route == null ? NotFound(new { error = "Route not found" }) : Ok(route);
     }
 
     [HttpPost]
-    public async Task<IActionResult> Create([FromBody] Models.Route dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.RouteId))
-            return BadRequest(new { error = "RouteId is required" });
-        if (string.IsNullOrWhiteSpace(dto.MatchPath))
-            return BadRequest(new { error = "MatchPath is required" });
-        if (string.IsNullOrWhiteSpace(dto.ClusterId))
-            return BadRequest(new { error = "ClusterId is required" });
+    public async Task<IActionResult> Create([FromBody] CreateRouteDto dto) =>
+        Ok(await _service.CreateAsync(dto));
 
-        dto.Id = 0; // force create
-        await _repo.AddOrUpdateRouteAsync(dto);
-        _provider.ForceReload();
-        return CreatedAtAction(nameof(GetById), new { id = dto.Id }, dto);
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(int id, [FromBody] CreateRouteDto dto)
+    {
+        var result = await _service.UpdateAsync(id, dto);
+        return result == null ? NotFound(new { error = "Route not found" }) : Ok(result);
     }
 
-    [HttpPut("{id:int}")]
-    public async Task<IActionResult> Update(int id, [FromBody] Models.Route dto)
-    {
-        var existing = await _repo.GetRouteByIdAsync(id);
-        if (existing is null) return NotFound();
-
-        existing.RouteId = dto.RouteId;
-        existing.MatchPath = dto.MatchPath;
-        existing.Methods = dto.Methods;
-        existing.ClusterId = dto.ClusterId;
-
-        await _repo.AddOrUpdateRouteAsync(existing);
-        _provider.ForceReload();
-        return Ok(existing);
-    }
-
-    [HttpDelete("{id:int}")]
-    public async Task<IActionResult> Delete(int id)
-    {
-        await _repo.DeleteRouteAsync(id);
-        _provider.ForceReload();
-        return NoContent();
-    }
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(int id) =>
+        await _service.DeleteAsync(id) ? Ok(new { message = "Route deleted" }) : NotFound(new { error = "Route not found" });
 }
