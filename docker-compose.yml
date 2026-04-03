@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  gateway:
+    build:
+      context: ./APIGateway/APIGateway
+      dockerfile: Dockerfile
+    container_name: apigateway_backend
+    restart: always
+    ports:
+      - "80:8080" # Exposed to outside world on port 80 (standard HTTP web traffic)
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+    volumes:
+      - gateway_data:/app
+
+  admin:
+    build:
+      context: ./gateway-admin
+      dockerfile: Dockerfile
+    container_name: apigateway_admin
+    restart: always
+    ports:
+      - "8888:80" # Access admin UI via localhost:8888
+    depends_on:
+      - gateway
+
+volumes:
+  gateway_data:

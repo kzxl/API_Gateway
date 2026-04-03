@@ -1,0 +1,115 @@
+{
+  "format": 1,
+  "restore": {
+    "E:\\15. Other\\API_Gateway\\GatewayNet48\\GatewayNet48.csproj": {}
+  },
+  "projects": {
+    "E:\\15. Other\\API_Gateway\\GatewayNet48\\GatewayNet48.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "E:\\15. Other\\API_Gateway\\GatewayNet48\\GatewayNet48.csproj",
+        "projectName": "GatewayNet48",
+        "projectPath": "E:\\15. Other\\API_Gateway\\GatewayNet48\\GatewayNet48.csproj",
+        "packagesPath": "C:\\Users\\phong.vo\\.nuget\\packages\\",
+        "outputPath": "E:\\15. Other\\API_Gateway\\GatewayNet48\\obj\\",
+        "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files\\DevExpress 24.2\\Components\\Offline Packages",
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
+        "configFilePaths": [
+          "C:\\Users\\phong.vo\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\DevExpress 20.1.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\DevExpress 24.2.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "C:\\Program Files (x86)\\DevExpress 20.1\\Components\\System\\Components\\Packages": {},
+          "C:\\Program Files (x86)\\Microsoft SDKs\\NuGetPackages\\": {},
+          "C:\\Program Files\\DevExpress 24.2\\Components\\System\\Components\\Packages": {},
+          "C:\\Program Files\\dotnet\\library-packs": {},
+          "E:\\15. Other\\LiteSql\\nupkg": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "targetAlias": "net48",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.200"
+      },
+      "frameworks": {
+        "net48": {
+          "targetAlias": "net48",
+          "dependencies": {
+            "BCrypt.Net-Next": {
+              "target": "Package",
+              "version": "[4.0.3, )"
+            },
+            "Dapper": {
+              "target": "Package",
+              "version": "[2.1.35, )"
+            },
+            "Microsoft.AspNet.WebApi.Core": {
+              "target": "Package",
+              "version": "[5.3.0, )"
+            },
+            "Microsoft.AspNet.WebApi.Owin": {
+              "target": "Package",
+              "version": "[5.3.0, )"
+            },
+            "Microsoft.AspNetCore.Owin": {
+              "target": "Package",
+              "version": "[8.0.0, )"
+            },
+            "Microsoft.Owin.Host.HttpListener": {
+              "target": "Package",
+              "version": "[4.2.2, )"
+            },
+            "Microsoft.Owin.Hosting": {
+              "target": "Package",
+              "version": "[4.2.2, )"
+            },
+            "Newtonsoft.Json": {
+              "target": "Package",
+              "version": "[13.0.3, )"
+            },
+            "Ocelot": {
+              "target": "Package",
+              "version": "[18.0.0, )"
+            },
+            "System.Data.SQLite.Core": {
+              "target": "Package",
+              "version": "[1.0.118, )"
+            },
+            "System.IdentityModel.Tokens.Jwt": {
+              "target": "Package",
+              "version": "[7.0.3, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.201\\RuntimeIdentifierGraph.json"
+        }
+      },
+      "runtimes": {
+        "win-x86": {
+          "#import": []
+        }
+      }
+    }
+  }
+}

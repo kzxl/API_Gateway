@@ -1,11 +1,21 @@
 import axios from "axios";
 
-const API_BASE = "http://localhost:5151";
-const API_KEY = "gw-admin-key-change-me";
+// Using relative path by default to allow Nginx reverse proxy to proxy API calls to Gateway backend
+const API_BASE = import.meta.env.VITE_API_BASE || "http://192.168.19.79:8887";
+const API_KEY = import.meta.env.VITE_API_KEY || "gw-admin-key-change-me";
 
 const api = axios.create({
   baseURL: API_BASE,
   headers: { "X-Api-Key": API_KEY },
+});
+
+// Add Authorization header with access token
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('accessToken');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
 });
 
 // ── Auth (public, no API key needed) ──
@@ -15,6 +25,10 @@ export const login = (username, password) =>
   publicApi.post("/auth/login", { username, password });
 export const validateToken = (token) =>
   publicApi.post("/auth/validate", { token });
+export const refreshToken = (refreshToken) =>
+  publicApi.post("/auth/refresh", { refreshToken });
+export const logout = (refreshToken) =>
+  api.post("/auth/logout", { refreshToken });
 
 // ── Routes ──
 export const getRoutes = () => api.get("/admin/routes");

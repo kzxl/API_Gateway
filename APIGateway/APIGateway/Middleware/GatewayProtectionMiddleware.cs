@@ -36,8 +36,8 @@ public class GatewayProtectionMiddleware
         _cache = cache;
         _scopeFactory = scopeFactory;
         
-        // Start background flusher for logs to GoFlow Engine (Batching)
-        _flushTimer ??= new Timer(FlushLogsToGoFlow, null, 3000, 3000);
+        // Start background flusher for logs to Database (Batching)
+        _flushTimer ??= new Timer(FlushLogsToDb, _scopeFactory, 3000, 3000);
 
         // L1-L2 Hybrid Sync: Poll routes version every 1 second from GoCache L2
         if (_syncTimer == null)
@@ -202,36 +202,29 @@ public class GatewayProtectionMiddleware
         });
     }
 
-    private static void FlushLogsToGoFlow(object? state)
+    private static void FlushLogsToDb(object? state)
     {
-        if (_logQueue.IsEmpty) return;
+        if (_logQueue.IsEmpty || state is not IServiceScopeFactory scopeFactory) return;
 
-        var logs = new List<object>();
+        var logs = new List<RequestLog>();
         while (_logQueue.TryDequeue(out var log) && logs.Count < 5000)
         {
-            logs.Add(new
-            {
-                timestamp = log.Timestamp.ToString("O"),
-                method = log.Method,
-                path = log.Path,
-                statusCode = log.StatusCode,
-                latencyMs = log.LatencyMs,
-                clientIp = log.ClientIp,
-                routeId = log.RouteId,
-                userAgent = log.UserAgent
-            });
+            logs.Add(log);
         }
 
         if (logs.Count > 0)
         {
-            // Send bulk batch to GoFlow engine (reduces HTTP calls by 5000x)
+            // Bulk insert to Database
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await _goFlowClient.PostAsJsonAsync("/log/batch", logs);
+                    using var scope = scopeFactory.CreateScope();
+                    var db = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+                    db.RequestLogs.AddRange(logs);
+                    await db.SaveChangesAsync();
                 }
-                catch { /* Ignore if GoFlow is down */ }
+                catch { /* Ignore */ }
             });
         }
     }

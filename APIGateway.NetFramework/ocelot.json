@@ -1,0 +1,61 @@
+{
+  "Routes": [
+    {
+      "DownstreamPathTemplate": "/test/{everything}",
+      "DownstreamScheme": "http",
+      "DownstreamHostAndPorts": [
+        {
+          "Host": "localhost",
+          "Port": 5001
+        }
+      ],
+      "UpstreamPathTemplate": "/test/{everything}",
+      "UpstreamHttpMethod": [ "GET", "POST", "PUT", "DELETE" ],
+      "RateLimitOptions": {
+        "ClientWhitelist": [],
+        "EnableRateLimiting": false,
+        "Period": "1s",
+        "PeriodTimespan": 1,
+        "Limit": 0
+      }
+    },
+    {
+      "DownstreamPathTemplate": "/{everything}",
+      "DownstreamScheme": "http",
+      "DownstreamHostAndPorts": [
+        {
+          "Host": "localhost",
+          "Port": 5001
+        }
+      ],
+      "UpstreamPathTemplate": "/{everything}",
+      "UpstreamHttpMethod": [ "GET", "POST", "PUT", "DELETE" ],
+      "RateLimitOptions": {
+        "ClientWhitelist": [],
+        "EnableRateLimiting": true,
+        "Period": "1s",
+        "PeriodTimespan": 1,
+        "Limit": 100
+      },
+      "QoSOptions": {
+        "ExceptionsAllowedBeforeBreaking": 3,
+        "DurationOfBreak": 30000,
+        "TimeoutValue": 5000
+      }
+    }
+  ],
+  "GlobalConfiguration": {
+    "BaseUrl": "http://localhost:5152",
+    "RateLimitOptions": {
+      "DisableRateLimitHeaders": false,
+      "QuotaExceededMessage": "Too many requests. Please try again later.",
+      "HttpStatusCode": 429,
+      "ClientIdHeader": "ClientId"
+    },
+    "QoSOptions": {
+      "ExceptionsAllowedBeforeBreaking": 3,
+      "DurationOfBreak": 30000,
+      "TimeoutValue": 5000
+    }
+  }
+}

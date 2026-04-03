@@ -24,7 +24,13 @@ public record CreateClusterDto(
     string LoadBalancingPolicy = "RoundRobin", int RetryCount = 0, int RetryDelayMs = 1000);
 
 // ── User DTOs ──
-public record UserDto(int Id, string Username, string Role, bool IsActive, DateTime CreatedAt);
+public record UserDto(int Id, string Username, string Role, bool IsActive, DateTime CreatedAt)
+{
+    public int FailedLoginAttempts { get; init; }
+    public DateTime? LockedUntil { get; init; }
+    public bool IsLocked { get; init; }
+}
+
 public record CreateUserDto(string Username, string Password, string? Role = "User");
 public record UpdateUserDto(string? Username = null, string? Password = null, string? Role = null, bool? IsActive = null);
 

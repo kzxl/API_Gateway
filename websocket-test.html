@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Test - API Gateway</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 800px;
+            width: 100%;
+            padding: 30px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .status {
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status.disconnected {
+            background: #fee;
+            color: #c33;
+        }
+        .status.connected {
+            background: #efe;
+            color: #3c3;
+        }
+        .status.connecting {
+            background: #ffc;
+            color: #cc6;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .btn-connect {
+            background: #667eea;
+            color: white;
+        }
+        .btn-disconnect {
+            background: #f56565;
+            color: white;
+        }
+        .btn-clear {
+            background: #eee;
+            color: #333;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn-send {
+            background: #48bb78;
+            color: white;
+            padding: 12px 32px;
+        }
+        .messages {
+            background: #f7f7f7;
+            border-radius: 8px;
+            padding: 20px;
+            height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .message {
+            margin-bottom: 12px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            line-height: 1.5;
+        }
+        .message.sent {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        .message.received {
+            background: #f1f8e9;
+            color: #558b2f;
+        }
+        .message.system {
+            background: #fff3e0;
+            color: #f57c00;
+        }
+        .timestamp {
+            color: #999;
+            font-size: 11px;
+            margin-right: 8px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .stat {
+            background: #f7f7f7;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔌 WebSocket Test</h1>
+        <p class="subtitle">API Gateway WebSocket Echo Demo</p>
+
+        <div id="status" class="status disconnected">
+            <span>●</span>
+            <span>Disconnected</span>
+        </div>
+
+        <div class="controls">
+            <button id="connectBtn" class="btn-connect">Connect</button>
+            <button id="disconnectBtn" class="btn-disconnect" disabled>Disconnect</button>
+            <button id="clearBtn" class="btn-clear">Clear Messages</button>
+        </div>
+
+        <div class="input-group">
+            <input type="text" id="messageInput" placeholder="Type a message..." disabled>
+            <button id="sendBtn" class="btn-send" disabled>Send</button>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value" id="sentCount">0</div>
+                <div class="stat-label">Messages Sent</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="receivedCount">0</div>
+                <div class="stat-label">Messages Received</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="latency">-</div>
+                <div class="stat-label">Latency (ms)</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let sentCount = 0;
+        let receivedCount = 0;
+        let sendTime = 0;
+
+        const statusEl = document.getElementById('status');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const messagesEl = document.getElementById('messages');
+
+        function updateStatus(status, text) {
+            statusEl.className = `status ${status}`;
+            statusEl.innerHTML = `<span>●</span><span>${text}</span>`;
+        }
+
+        function addMessage(type, text) {
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.className = `message ${type}`;
+            div.innerHTML = `<span class="timestamp">${time}</span>${text}`;
+            messagesEl.appendChild(div);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        function connect() {
+            updateStatus('connecting', 'Connecting...');
+            addMessage('system', 'Connecting to ws://localhost:5151/ws/echo...');
+
+            ws = new WebSocket('ws://localhost:5151/ws/echo');
+
+            ws.onopen = () => {
+                updateStatus('connected', 'Connected');
+                addMessage('system', '✓ Connected successfully!');
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                messageInput.disabled = false;
+                sendBtn.disabled = false;
+                messageInput.focus();
+            };
+
+            ws.onmessage = (event) => {
+                receivedCount++;
+                document.getElementById('receivedCount').textContent = receivedCount;
+
+                const latency = Date.now() - sendTime;
+                document.getElementById('latency').textContent = latency;
+
+                addMessage('received', event.data);
+            };
+
+            ws.onerror = (error) => {
+                addMessage('system', '✗ WebSocket error occurred');
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onclose = () => {
+                updateStatus('disconnected', 'Disconnected');
+                addMessage('system', '✗ Connection closed');
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                messageInput.disabled = true;
+                sendBtn.disabled = true;
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            sendTime = Date.now();
+            ws.send(message);
+
+            sentCount++;
+            document.getElementById('sentCount').textContent = sentCount;
+
+            addMessage('sent', message);
+            messageInput.value = '';
+            messageInput.focus();
+        }
+
+        function clearMessages() {
+            messagesEl.innerHTML = '';
+            sentCount = 0;
+            receivedCount = 0;
+            document.getElementById('sentCount').textContent = '0';
+            document.getElementById('receivedCount').textContent = '0';
+            document.getElementById('latency').textContent = '-';
+        }
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        clearBtn.addEventListener('click', clearMessages);
+        sendBtn.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // Auto-connect on load
+        setTimeout(connect, 500);
+    </script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 using APIGateway.Core.Interfaces;
 using APIGateway.Core.Interfaces.DTOs;
+using APIGateway.Infrastructure.Attributes;
 using Microsoft.AspNetCore.Mvc;
 
 namespace APIGateway.Controllers;
@@ -17,9 +18,11 @@ public class AdminRoutesController : ControllerBase
     public AdminRoutesController(IRouteService service) => _service = service;
 
     [HttpGet]
+    [RequirePermission("routes.read")]
     public async Task<IActionResult> GetAll() => Ok(await _service.GetAllAsync());
 
     [HttpGet("{id}")]
+    [RequirePermission("routes.read")]
     public async Task<IActionResult> GetById(int id)
     {
         var route = await _service.GetByIdAsync(id);
@@ -27,10 +30,12 @@ public class AdminRoutesController : ControllerBase
     }
 
     [HttpPost]
+    [RequirePermission("routes.write")]
     public async Task<IActionResult> Create([FromBody] CreateRouteDto dto) =>
         Ok(await _service.CreateAsync(dto));
 
     [HttpPut("{id}")]
+    [RequirePermission("routes.write")]
     public async Task<IActionResult> Update(int id, [FromBody] CreateRouteDto dto)
     {
         var result = await _service.UpdateAsync(id, dto);
@@ -38,6 +43,7 @@ public class AdminRoutesController : ControllerBase
     }
 
     [HttpDelete("{id}")]
+    [RequirePermission("routes.delete")]
     public async Task<IActionResult> Delete(int id) =>
         await _service.DeleteAsync(id) ? Ok(new { message = "Route deleted" }) : NotFound(new { error = "Route not found" });
 }

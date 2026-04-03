@@ -27,6 +27,11 @@ public interface IUserService
     Task<UserDto?> UpdateAsync(int id, UpdateUserDto dto);
     Task<bool> DeleteAsync(int id);
     Task<UserDto?> ValidateCredentialsAsync(string username, string password);
+    Task<UserDto?> GetByIdAsync(int id);
+    Task<UserDto?> GetByUsernameAsync(string username);
+    Task IncrementFailedLoginAsync(int userId);
+    Task ResetFailedLoginAsync(int userId);
+    Task LockAccountAsync(int userId, TimeSpan duration);
 }
 
 public interface ILogService

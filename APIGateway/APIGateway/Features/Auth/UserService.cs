@@ -67,4 +67,53 @@ public class UserService : IUserService
             return null;
         return new UserDto(user.Id, user.Username, user.Role, user.IsActive, user.CreatedAt);
     }
+
+    public async Task<UserDto?> GetByIdAsync(int id)
+    {
+        var user = await _db.Users.FindAsync(id);
+        if (user == null) return null;
+        return new UserDto(user.Id, user.Username, user.Role, user.IsActive, user.CreatedAt);
+    }
+
+    public async Task<UserDto?> GetByUsernameAsync(string username)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Username == username);
+        if (user == null) return null;
+        return new UserDto(user.Id, user.Username, user.Role, user.IsActive, user.CreatedAt)
+        {
+            FailedLoginAttempts = user.FailedLoginAttempts,
+            LockedUntil = user.LockedUntil,
+            IsLocked = user.IsLocked
+        };
+    }
+
+    public async Task IncrementFailedLoginAsync(int userId)
+    {
+        var user = await _db.Users.FindAsync(userId);
+        if (user == null) return;
+
+        user.FailedLoginAttempts++;
+        user.LastFailedLogin = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+    }
+
+    public async Task ResetFailedLoginAsync(int userId)
+    {
+        var user = await _db.Users.FindAsync(userId);
+        if (user == null) return;
+
+        user.FailedLoginAttempts = 0;
+        user.LastFailedLogin = null;
+        user.LockedUntil = null;
+        await _db.SaveChangesAsync();
+    }
+
+    public async Task LockAccountAsync(int userId, TimeSpan duration)
+    {
+        var user = await _db.Users.FindAsync(userId);
+        if (user == null) return;
+
+        user.LockedUntil = DateTime.UtcNow.Add(duration);
+        await _db.SaveChangesAsync();
+    }
 }
