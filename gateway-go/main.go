@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -114,6 +115,16 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
+	// Initialize logging to file
+	logFile, err := os.OpenFile("gateway.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		multiWriter := io.MultiWriter(os.Stdout, logFile)
+		log.SetOutput(multiWriter)
+		log.Println("✅ Log file initialized: gateway.log")
+	} else {
+		log.Println("⚠️ Failed to initialize log file, using default stdout")
+	}
+
 	// Initialize cache
 	initCache()
 
