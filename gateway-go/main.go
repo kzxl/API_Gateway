@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,7 +21,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/rs/cors"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/time/rate"
@@ -50,6 +51,13 @@ type Route struct {
 	MatchPath          string
 	RateLimitPerSecond int
 	IsActive           bool
+	Methods                       string
+	CircuitBreakerThreshold       int
+	CircuitBreakerDurationSeconds int
+	IpWhitelist                   string
+	IpBlacklist                   string
+	CacheTtlSeconds               int
+	TransformsJson                string
 }
 
 type Cluster struct {
@@ -58,6 +66,12 @@ type Cluster struct {
 	DestinationsJSON    string
 	LoadBalancingPolicy string
 	IsActive            bool
+	EnableHealthCheck          int
+	HealthCheckPath            string
+	HealthCheckIntervalSeconds int
+	HealthCheckTimeoutSeconds  int
+	RetryCount                 int
+	RetryDelayMs               int
 }
 
 type Destination struct {
@@ -142,6 +156,7 @@ func main() {
 
 	admin.HandleFunc("/metrics", metricsHandler).Methods("GET")
 	admin.HandleFunc("/stats", statsHandler).Methods("GET")
+	admin.HandleFunc("/health", healthHandler).Methods("GET")
 
 	// Setup proxy routes
 	setupProxyRoutes(r)
@@ -201,13 +216,28 @@ func initCache() {
 // Database initialization
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "./gateway.db")
+	db, err = sql.Open("sqlite", "./gateway.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Create tables
 	createTables()
+
+	db.Exec("ALTER TABLE Routes ADD COLUMN Methods TEXT")
+	db.Exec("ALTER TABLE Routes ADD COLUMN CircuitBreakerThreshold INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE Routes ADD COLUMN CircuitBreakerDurationSeconds INTEGER DEFAULT 30")
+	db.Exec("ALTER TABLE Routes ADD COLUMN IpWhitelist TEXT")
+	db.Exec("ALTER TABLE Routes ADD COLUMN IpBlacklist TEXT")
+	db.Exec("ALTER TABLE Routes ADD COLUMN CacheTtlSeconds INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE Routes ADD COLUMN TransformsJson TEXT")
+
+	db.Exec("ALTER TABLE Clusters ADD COLUMN EnableHealthCheck INTEGER DEFAULT 1")
+	db.Exec("ALTER TABLE Clusters ADD COLUMN HealthCheckPath TEXT DEFAULT '/health'")
+	db.Exec("ALTER TABLE Clusters ADD COLUMN HealthCheckIntervalSeconds INTEGER DEFAULT 10")
+	db.Exec("ALTER TABLE Clusters ADD COLUMN HealthCheckTimeoutSeconds INTEGER DEFAULT 5")
+	db.Exec("ALTER TABLE Clusters ADD COLUMN RetryCount INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE Clusters ADD COLUMN RetryDelayMs INTEGER DEFAULT 1000")
 
 	// Seed data
 	seedData()
@@ -340,11 +370,71 @@ func authMiddleware(next http.Handler) http.Handler {
 
 // Handlers
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+    var totalRoutes, activeRoutes int
+    db.QueryRow("SELECT COUNT(*) FROM Routes").Scan(&totalRoutes)
+    db.QueryRow("SELECT COUNT(*) FROM Routes WHERE IsActive = 1").Scan(&activeRoutes)
+
+    var totalClusters int
+    db.QueryRow("SELECT COUNT(*) FROM Clusters").Scan(&totalClusters)
+
+    type healthDest struct {
+        ClusterId                  string `json:"clusterId"`
+        Address                    string `json:"address"`
+        Role                       string `json:"role"`
+        HealthCheck                string `json:"healthCheck"`
+        HealthCheckPath            string `json:"healthCheckPath"`
+        HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
+    }
+    var destinations []healthDest
+    
+    rows, err := db.Query("SELECT ClusterId, DestinationsJson, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds FROM Clusters")
+    if err == nil {
+        defer rows.Close()
+        for rows.Next() {
+            var cid, djson string
+			var hpath string = "/health"
+            var eh, hint int = 1, 10
+            
+            // Need nullable scanning for newly added columns
+            var niEh, niHint sql.NullInt64
+            var nsHpath sql.NullString
+            
+            rows.Scan(&cid, &djson, &niEh, &nsHpath, &niHint)
+            
+            if niEh.Valid { eh = int(niEh.Int64) }
+            if nsHpath.Valid { hpath = nsHpath.String }
+            if niHint.Valid { hint = int(niHint.Int64) }
+            
+            var dests []Destination
+            json.Unmarshal([]byte(djson), &dests)
+            for _, d := range dests {
+                healthCheckStr := "Disabled"
+                if eh == 1 {
+                    healthCheckStr = "Enabled"
+                }
+                destinations = append(destinations, healthDest{
+                    ClusterId: cid,
+                    Address: d.Address,
+                    Role: d.Health,
+                    HealthCheck: healthCheckStr,
+                    HealthCheckPath: hpath,
+                    HealthCheckIntervalSeconds: hint,
+                })
+            }
+        }
+    }
+
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"status":        "ok",
 		"timestamp":     time.Now().Format(time.RFC3339),
 		"uptime":        int(time.Since(metrics.StartTime).Seconds()),
 		"wsConnections": atomic.LoadInt64(&metrics.WSConnections),
+        "gateway": map[string]interface{}{
+            "totalRoutes": totalRoutes,
+            "totalClusters": totalClusters,
+            "activeProxyRoutes": activeRoutes,
+        },
+        "destinations": destinations,
 	})
 }
 
@@ -506,7 +596,7 @@ func getUsersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var users []map[string]interface{}
+	var users = make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id int64
 		var username, role, createdAt string
@@ -555,10 +645,71 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func updateUserHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+		IsActive bool   `json:"isActive"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	// Build update query
+	query := "UPDATE Users SET Username = ?, Role = ?, IsActive = ?"
+	args := []interface{}{req.Username, req.Role, req.IsActive}
+
+	// Only update password if provided
+	if req.Password != "" {
+		hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+		query += ", PasswordHash = ?"
+		args = append(args, string(hash))
+	}
+
+	query += " WHERE Id = ?"
+	args = append(args, id)
+
+	result, err := db.Exec(query, args...)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "User not found"})
+		return
+	}
+
+	// Invalidate user cache
+	userCache.Flush()
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":       id,
+		"username": req.Username,
+		"role":     req.Role,
+		"isActive": req.IsActive,
+	})
 }
 
 func deleteUserHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	_, err := db.Exec("DELETE FROM Users WHERE Id = ?", id)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Invalidate user cache
+	userCache.Flush()
+
 	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
 
@@ -571,20 +722,26 @@ func getRoutesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache miss - query database
-	rows, err := db.Query("SELECT Id, RouteId, ClusterId, MatchPath, RateLimitPerSecond, IsActive FROM Routes ORDER BY Id DESC")
+	rows, err := db.Query("SELECT Id, RouteId, ClusterId, MatchPath, RateLimitPerSecond, IsActive, Methods, CircuitBreakerThreshold, CircuitBreakerDurationSeconds, IpWhitelist, IpBlacklist, CacheTtlSeconds, TransformsJson FROM Routes ORDER BY Id DESC")
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
 
-	var routes []map[string]interface{}
+	var routes = make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id int64
 		var routeID, clusterID, matchPath string
 		var rateLimit int
 		var isActive bool
-		rows.Scan(&id, &routeID, &clusterID, &matchPath, &rateLimit, &isActive)
+
+		// Some old rows might have NULLs for new fields, so we use sql.NullString / sql.NullInt64
+		var nsMethods, nsIpW, nsIpB, nsTransforms sql.NullString
+		var niCbT, niCbD, niCacheT sql.NullInt64
+
+		rows.Scan(&id, &routeID, &clusterID, &matchPath, &rateLimit, &isActive, &nsMethods, &niCbT, &niCbD, &nsIpW, &nsIpB, &niCacheT, &nsTransforms)
+		
 		routes = append(routes, map[string]interface{}{
 			"id":                 id,
 			"routeId":            routeID,
@@ -592,6 +749,13 @@ func getRoutesHandler(w http.ResponseWriter, r *http.Request) {
 			"matchPath":          matchPath,
 			"rateLimitPerSecond": rateLimit,
 			"isActive":           isActive,
+			"methods":            nsMethods.String,
+			"circuitBreakerThreshold":       niCbT.Int64,
+			"circuitBreakerDurationSeconds": niCbD.Int64,
+			"ipWhitelist":                   nsIpW.String,
+			"ipBlacklist":                   nsIpB.String,
+			"cacheTtlSeconds":               niCacheT.Int64,
+			"transformsJson":                nsTransforms.String,
 		})
 	}
 
@@ -602,15 +766,134 @@ func getRoutesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createRouteHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	var req struct {
+		RouteID            string `json:"routeId"`
+		ClusterID          string `json:"clusterId"`
+		MatchPath          string `json:"matchPath"`
+		RateLimitPerSecond int    `json:"rateLimitPerSecond"`
+		IsActive           bool   `json:"isActive"`
+		Methods                       string `json:"methods"`
+		CircuitBreakerThreshold       int    `json:"circuitBreakerThreshold"`
+		CircuitBreakerDurationSeconds int    `json:"circuitBreakerDurationSeconds"`
+		IpWhitelist                   string `json:"ipWhitelist"`
+		IpBlacklist                   string `json:"ipBlacklist"`
+		CacheTtlSeconds               int    `json:"cacheTtlSeconds"`
+		TransformsJson                string `json:"transformsJson"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	result, err := db.Exec("INSERT INTO Routes (RouteId, ClusterId, MatchPath, RateLimitPerSecond, IsActive, Methods, CircuitBreakerThreshold, CircuitBreakerDurationSeconds, IpWhitelist, IpBlacklist, CacheTtlSeconds, TransformsJson) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		req.RouteID, req.ClusterID, req.MatchPath, req.RateLimitPerSecond, true, req.Methods, req.CircuitBreakerThreshold, req.CircuitBreakerDurationSeconds, req.IpWhitelist, req.IpBlacklist, req.CacheTtlSeconds, req.TransformsJson)
+
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	id, _ := result.LastInsertId()
+
+	// Invalidate route cache
+	routeCache.Delete("routes:all")
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                 id,
+		"routeId":            req.RouteID,
+		"clusterId":          req.ClusterID,
+		"matchPath":          req.MatchPath,
+		"rateLimitPerSecond": req.RateLimitPerSecond,
+		"isActive":           req.IsActive,
+		"methods":            req.Methods,
+		"circuitBreakerThreshold": req.CircuitBreakerThreshold,
+		"circuitBreakerDurationSeconds": req.CircuitBreakerDurationSeconds,
+		"ipWhitelist": req.IpWhitelist,
+		"ipBlacklist": req.IpBlacklist,
+		"cacheTtlSeconds": req.CacheTtlSeconds,
+		"transformsJson": req.TransformsJson,
+	})
 }
 
 func updateRouteHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var req struct {
+		RouteID            string `json:"routeId"`
+		ClusterID          string `json:"clusterId"`
+		MatchPath          string `json:"matchPath"`
+		RateLimitPerSecond int    `json:"rateLimitPerSecond"`
+		IsActive           bool   `json:"isActive"`
+		Methods                       string `json:"methods"`
+		CircuitBreakerThreshold       int    `json:"circuitBreakerThreshold"`
+		CircuitBreakerDurationSeconds int    `json:"circuitBreakerDurationSeconds"`
+		IpWhitelist                   string `json:"ipWhitelist"`
+		IpBlacklist                   string `json:"ipBlacklist"`
+		CacheTtlSeconds               int    `json:"cacheTtlSeconds"`
+		TransformsJson                string `json:"transformsJson"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	result, err := db.Exec("UPDATE Routes SET RouteId = ?, ClusterId = ?, MatchPath = ?, RateLimitPerSecond = ?, IsActive = ?, Methods = ?, CircuitBreakerThreshold = ?, CircuitBreakerDurationSeconds = ?, IpWhitelist = ?, IpBlacklist = ?, CacheTtlSeconds = ?, TransformsJson = ? WHERE Id = ?",
+		req.RouteID, req.ClusterID, req.MatchPath, req.RateLimitPerSecond, true, req.Methods, req.CircuitBreakerThreshold, req.CircuitBreakerDurationSeconds, req.IpWhitelist, req.IpBlacklist, req.CacheTtlSeconds, req.TransformsJson, id)
+
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Route not found"})
+		return
+	}
+
+	// Invalidate route cache
+	routeCache.Delete("routes:all")
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                 id,
+		"routeId":            req.RouteID,
+		"clusterId":          req.ClusterID,
+		"matchPath":          req.MatchPath,
+		"rateLimitPerSecond": req.RateLimitPerSecond,
+		"isActive":           req.IsActive,
+		"methods":            req.Methods,
+		"circuitBreakerThreshold": req.CircuitBreakerThreshold,
+		"circuitBreakerDurationSeconds": req.CircuitBreakerDurationSeconds,
+		"ipWhitelist": req.IpWhitelist,
+		"ipBlacklist": req.IpBlacklist,
+		"cacheTtlSeconds": req.CacheTtlSeconds,
+		"transformsJson": req.TransformsJson,
+	})
 }
 
 func deleteRouteHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	result, err := db.Exec("DELETE FROM Routes WHERE Id = ?", id)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Route not found"})
+		return
+	}
+
+	// Invalidate route cache
+	routeCache.Delete("routes:all")
+
+	respondJSON(w, http.StatusOK, map[string]string{"message": "Route deleted"})
 }
 
 // Cluster handlers
@@ -622,29 +905,38 @@ func getClustersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache miss - query database
-	rows, err := db.Query("SELECT Id, ClusterId, DestinationsJson, LoadBalancingPolicy, IsActive FROM Clusters ORDER BY Id DESC")
+	rows, err := db.Query("SELECT Id, ClusterId, DestinationsJson, LoadBalancingPolicy, IsActive, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds, HealthCheckTimeoutSeconds, RetryCount, RetryDelayMs FROM Clusters ORDER BY Id DESC")
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
 
-	var clusters []map[string]interface{}
+	var clusters = make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id int64
 		var clusterID, destJSON, lbPolicy string
 		var isActive bool
-		rows.Scan(&id, &clusterID, &destJSON, &lbPolicy, &isActive)
+        var niEh, niHint, niHtout, niRtry, niRdel sql.NullInt64
+        var nsHth sql.NullString
 
-		var destinations []Destination
-		json.Unmarshal([]byte(destJSON), &destinations)
+		rows.Scan(&id, &clusterID, &destJSON, &lbPolicy, &isActive, &niEh, &nsHth, &niHint, &niHtout, &niRtry, &niRdel)
+
+        eh := true
+        if niEh.Valid && niEh.Int64 == 0 { eh = false }
 
 		clusters = append(clusters, map[string]interface{}{
 			"id":                  id,
 			"clusterId":           clusterID,
-			"destinations":        destinations,
+			"destinationsJson":    destJSON,
 			"loadBalancingPolicy": lbPolicy,
 			"isActive":            isActive,
+            "enableHealthCheck":   eh,
+            "healthCheckPath":     nsHth.String,
+            "healthCheckIntervalSeconds": niHint.Int64,
+            "healthCheckTimeoutSeconds": niHtout.Int64,
+            "retryCount":          niRtry.Int64,
+            "retryDelayMs":        niRdel.Int64,
 		})
 	}
 
@@ -655,15 +947,132 @@ func getClustersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createClusterHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	var req struct {
+		ClusterID           string        `json:"clusterId"`
+		DestinationsJson    string        `json:"destinationsJson"`
+		LoadBalancingPolicy string        `json:"loadBalancingPolicy"`
+		IsActive            bool          `json:"isActive"`
+		EnableHealthCheck          bool   `json:"enableHealthCheck"`
+		HealthCheckPath            string `json:"healthCheckPath"`
+		HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
+		HealthCheckTimeoutSeconds  int    `json:"healthCheckTimeoutSeconds"`
+		RetryCount                 int    `json:"retryCount"`
+		RetryDelayMs               int    `json:"retryDelayMs"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	eh := 0
+	if req.EnableHealthCheck { eh = 1 }
+
+	result, err := db.Exec("INSERT INTO Clusters (ClusterId, DestinationsJson, LoadBalancingPolicy, IsActive, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds, HealthCheckTimeoutSeconds, RetryCount, RetryDelayMs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		req.ClusterID, req.DestinationsJson, req.LoadBalancingPolicy, true, eh, req.HealthCheckPath, req.HealthCheckIntervalSeconds, req.HealthCheckTimeoutSeconds, req.RetryCount, req.RetryDelayMs)
+
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	id, _ := result.LastInsertId()
+
+	// Invalidate cluster cache
+	clusterCache.Delete("clusters:all")
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                  id,
+		"clusterId":           req.ClusterID,
+		"destinationsJson":    req.DestinationsJson,
+		"loadBalancingPolicy": req.LoadBalancingPolicy,
+		"isActive":            req.IsActive,
+		"enableHealthCheck":   req.EnableHealthCheck,
+		"healthCheckPath":     req.HealthCheckPath,
+		"healthCheckIntervalSeconds": req.HealthCheckIntervalSeconds,
+		"healthCheckTimeoutSeconds":  req.HealthCheckTimeoutSeconds,
+		"retryCount":          req.RetryCount,
+		"retryDelayMs":        req.RetryDelayMs,
+	})
 }
 
 func updateClusterHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var req struct {
+		ClusterID           string        `json:"clusterId"`
+		DestinationsJson    string        `json:"destinationsJson"`
+		LoadBalancingPolicy string        `json:"loadBalancingPolicy"`
+		IsActive            bool          `json:"isActive"`
+		EnableHealthCheck          bool   `json:"enableHealthCheck"`
+		HealthCheckPath            string `json:"healthCheckPath"`
+		HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
+		HealthCheckTimeoutSeconds  int    `json:"healthCheckTimeoutSeconds"`
+		RetryCount                 int    `json:"retryCount"`
+		RetryDelayMs               int    `json:"retryDelayMs"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	eh := 0
+	if req.EnableHealthCheck { eh = 1 }
+
+	result, err := db.Exec("UPDATE Clusters SET ClusterId = ?, DestinationsJson = ?, LoadBalancingPolicy = ?, IsActive = ?, EnableHealthCheck = ?, HealthCheckPath = ?, HealthCheckIntervalSeconds = ?, HealthCheckTimeoutSeconds = ?, RetryCount = ?, RetryDelayMs = ? WHERE Id = ?",
+		req.ClusterID, req.DestinationsJson, req.LoadBalancingPolicy, true, eh, req.HealthCheckPath, req.HealthCheckIntervalSeconds, req.HealthCheckTimeoutSeconds, req.RetryCount, req.RetryDelayMs, id)
+
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Cluster not found"})
+		return
+	}
+
+	// Invalidate cluster cache
+	clusterCache.Delete("clusters:all")
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                  id,
+		"clusterId":           req.ClusterID,
+		"destinationsJson":    req.DestinationsJson,
+		"loadBalancingPolicy": req.LoadBalancingPolicy,
+		"isActive":            req.IsActive,
+		"enableHealthCheck":   req.EnableHealthCheck,
+		"healthCheckPath":     req.HealthCheckPath,
+		"healthCheckIntervalSeconds": req.HealthCheckIntervalSeconds,
+		"healthCheckTimeoutSeconds":  req.HealthCheckTimeoutSeconds,
+		"retryCount":          req.RetryCount,
+		"retryDelayMs":        req.RetryDelayMs,
+	})
 }
 
 func deleteClusterHandler(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]bool{"success": true})
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	result, err := db.Exec("DELETE FROM Clusters WHERE Id = ?", id)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Cluster not found"})
+		return
+	}
+
+	// Invalidate cluster cache
+	clusterCache.Delete("clusters:all")
+
+	respondJSON(w, http.StatusOK, map[string]string{"message": "Cluster deleted"})
 }
 
 // Metrics handlers
@@ -713,60 +1122,126 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 // Proxy setup
 func setupProxyRoutes(r *mux.Router) {
-	rows, err := db.Query("SELECT RouteId, ClusterId, MatchPath, RateLimitPerSecond FROM Routes WHERE IsActive = 1 ORDER BY LENGTH(MatchPath) DESC")
-	if err != nil {
-		log.Printf("Error loading routes: %v\n", err)
-		return
-	}
-	defer rows.Close()
+	r.PathPrefix("/").HandlerFunc(dynamicProxyHandler)
+}
 
-	for rows.Next() {
-		var routeID, clusterID, matchPath string
-		var rateLimit int
-		rows.Scan(&routeID, &clusterID, &matchPath, &rateLimit)
-
-		// Check cache for cluster
-		cacheKey := "cluster:" + clusterID
-		var destinations []Destination
-
-		if cached, found := clusterCache.Get(cacheKey); found {
-			destinations = cached.([]Destination)
-		} else {
-			// Cache miss - query database
-			var destJSON string
-			db.QueryRow("SELECT DestinationsJson FROM Clusters WHERE ClusterId = ? AND IsActive = 1", clusterID).Scan(&destJSON)
-			json.Unmarshal([]byte(destJSON), &destinations)
-
-			// Cache the cluster
-			clusterCache.Set(cacheKey, destinations, cache.DefaultExpiration)
+func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
+	// Look up routes from cache or DB
+	var routes []map[string]interface{}
+	if cached, found := routeCache.Get("routes:all"); found {
+		routes = cached.([]map[string]interface{})
+	} else {
+		// Cache miss - query database
+		rows, err := db.Query("SELECT Id, RouteId, ClusterId, MatchPath, RateLimitPerSecond, IsActive, Methods, CircuitBreakerThreshold, CircuitBreakerDurationSeconds, IpWhitelist, IpBlacklist, CacheTtlSeconds, TransformsJson FROM Routes ORDER BY LENGTH(MatchPath) DESC")
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to load routes"})
+			return
 		}
+		defer rows.Close()
 
-		if len(destinations) == 0 {
+		for rows.Next() {
+			var id int64
+			var routeID, clusterID, matchPath string
+			var rateLimit int
+			var isActive bool
+
+			var nsMethods, nsIpW, nsIpB, nsTransforms sql.NullString
+			var niCbT, niCbD, niCacheT sql.NullInt64
+
+			rows.Scan(&id, &routeID, &clusterID, &matchPath, &rateLimit, &isActive, &nsMethods, &niCbT, &niCbD, &nsIpW, &nsIpB, &niCacheT, &nsTransforms)
+			
+			routes = append(routes, map[string]interface{}{
+				"id":                 id,
+				"routeId":            routeID,
+				"clusterId":          clusterID,
+				"matchPath":          matchPath,
+				"rateLimitPerSecond": rateLimit,
+				"isActive":           isActive,
+				"methods":            nsMethods.String,
+				"circuitBreakerThreshold":       niCbT.Int64,
+				"circuitBreakerDurationSeconds": niCbD.Int64,
+				"ipWhitelist":                   nsIpW.String,
+				"ipBlacklist":                   nsIpB.String,
+				"cacheTtlSeconds":               niCacheT.Int64,
+				"transformsJson":                nsTransforms.String,
+			})
+		}
+		routeCache.Set("routes:all", routes, cache.DefaultExpiration)
+	}
+
+	var matchedRoute map[string]interface{}
+	var prefix string
+	reqPath := req.URL.Path
+
+	for _, rt := range routes {
+		if isActive, ok := rt["isActive"].(bool); !ok || !isActive {
 			continue
 		}
+		matchPath := rt["matchPath"].(string)
 
-		target := destinations[0].Address
-
-		// Create proxy handler
-		targetURL, _ := url.Parse(target)
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-		r.PathPrefix(matchPath).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Rate limiting
-			if rateLimit > 0 {
-				limiter := getRateLimiter(routeID, rateLimit)
-				if !limiter.Allow() {
-					respondJSON(w, http.StatusTooManyRequests, map[string]string{"error": "Too many requests"})
-					return
-				}
-			}
-
-			log.Printf("[PROXY] %s %s -> %s\n", r.Method, r.URL.Path, target)
-			proxy.ServeHTTP(w, r)
-		})
-
-		log.Printf("✅ Route: %s -> %s (cached)\n", matchPath, target)
+		if reqPath == matchPath || strings.HasPrefix(reqPath, matchPath+"/") {
+			matchedRoute = rt
+			prefix = matchPath
+			break
+		}
 	}
+
+	if matchedRoute == nil {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "No route matched"})
+		return
+	}
+
+	routeID := matchedRoute["routeId"].(string)
+	clusterID := matchedRoute["clusterId"].(string)
+	
+	rateLimit := 0
+	if rl, ok := matchedRoute["rateLimitPerSecond"].(int); ok {
+		rateLimit = rl
+	} else if rl, ok := matchedRoute["rateLimitPerSecond"].(int64); ok {
+		rateLimit = int(rl)
+	} else if rl, ok := matchedRoute["rateLimitPerSecond"].(float64); ok {
+		rateLimit = int(rl)
+	}
+
+	if rateLimit > 0 {
+		limiter := getRateLimiter(routeID, rateLimit)
+		if !limiter.Allow() {
+			respondJSON(w, http.StatusTooManyRequests, map[string]string{"error": "Too many requests"})
+			return
+		}
+	}
+
+	// Load destinations
+	var destinations []Destination
+	cacheKey := "cluster:" + clusterID
+	if cached, found := clusterCache.Get(cacheKey); found {
+		destinations = cached.([]Destination)
+	} else {
+		var destJSON string
+		err := db.QueryRow("SELECT DestinationsJson FROM Clusters WHERE ClusterId = ? AND IsActive = 1", clusterID).Scan(&destJSON)
+		if err == nil && destJSON != "" {
+			json.Unmarshal([]byte(destJSON), &destinations)
+			clusterCache.Set(cacheKey, destinations, cache.DefaultExpiration)
+		}
+	}
+
+	if len(destinations) == 0 {
+		respondJSON(w, http.StatusBadGateway, map[string]interface{}{"error": "No healthy upstream destinations for cluster " + clusterID})
+		return
+	}
+
+	target := destinations[0].Address
+	targetURL, _ := url.Parse(target)
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	originalPath := req.URL.Path
+	req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+	if req.URL.Path == "" {
+		req.URL.Path = "/"
+	}
+
+	log.Printf("[DYNAMIC PROXY] %s %s -> %s%s (stripped: %s)\n", req.Method, originalPath, target, req.URL.Path, prefix)
+	proxy.ServeHTTP(w, req)
 }
 
 func getRateLimiter(key string, rps int) *rate.Limiter {
