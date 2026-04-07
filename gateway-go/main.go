@@ -1242,7 +1242,15 @@ func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	target := destinations[0].Address
-	targetURL, _ := url.Parse(target)
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = "http://" + target
+	}
+	targetURL, err := url.Parse(target)
+	if err != nil || targetURL == nil {
+		log.Printf("⚠️ Invalid target URL parsed: %s, err: %v", target, err)
+		respondJSON(w, http.StatusBadGateway, map[string]string{"error": "Invalid gateway upstream URL"})
+		return
+	}
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
 	originalPath := req.URL.Path
