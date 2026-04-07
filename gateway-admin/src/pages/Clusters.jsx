@@ -58,7 +58,7 @@ export default function Clusters() {
   const load = async () => {
     setLoading(true);
     try {
-      setClusters((await getClusters()).data);
+      setClusters((await getClusters()).data || []);
     } catch (err) {
       message.error(
         "Failed to load clusters: " +
@@ -91,11 +91,12 @@ export default function Clusters() {
     let dests = [{ address: "", health: "Active" }];
     try {
       const parsed = JSON.parse(record.destinationsJson || "[]");
-      if (parsed.length > 0)
+      if (Array.isArray(parsed) && parsed.length > 0) {
         dests = parsed.map((d) => ({
-          address: d.address,
-          health: d.health || "Active",
+          address: d?.address || "",
+          health: d?.health || "Active",
         }));
+      }
     } catch {
       /* keep default */
     }
@@ -185,7 +186,8 @@ export default function Clusters() {
 
   const parseDestinations = (json) => {
     try {
-      return JSON.parse(json || "[]");
+      const parsed = JSON.parse(json || "[]");
+      return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
     }

@@ -4,6 +4,11 @@ import axios from 'axios';
 
 const AuthContext = createContext(null);
 
+// Get dynamic API base URL
+const getApiBase = () => {
+  return localStorage.getItem('apiBaseUrl') || 'http://localhost:8887';
+};
+
 /**
  * Auth Provider with JWT + Refresh Token support.
  * UArch: Zero-allocation state management, optimistic updates.
@@ -51,7 +56,7 @@ export function AuthProvider({ children }) {
           if (refreshToken) {
             try {
               const res = await axios.post(
-                `${import.meta.env.VITE_API_BASE || 'http://192.168.19.79:8887'}/auth/refresh`,
+                `${getApiBase()}/auth/refresh`,
                 { refreshToken }
               );
 
@@ -98,7 +103,7 @@ export function AuthProvider({ children }) {
     if (refreshToken) {
       try {
         await axios.post(
-          `${import.meta.env.VITE_API_BASE || 'http://192.168.19.79:8887'}/auth/logout`,
+          `${getApiBase()}/auth/logout`,
           { refreshToken },
           {
             headers: {

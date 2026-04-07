@@ -38,19 +38,19 @@ namespace GatewayControlPanel
                 switch (gatewayType)
                 {
                     case 0: // Node.js
-                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "gateway-node");
+                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "gateways", "gateway-node");
                         command = "cmd.exe";
                         args = $"/c set PORT={port} && node server-uarch.js";
                         break;
 
                     case 1: // Go
-                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "gateway-go");
-                        command = "cmd.exe";
-                        args = $"/c set PORT={port} && go run main.go context.go";
+                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "gateways", "gateway-go");
+                        command = Path.Combine(workingDir, "gateway.exe");
+                        args = "";
                         break;
 
                     case 2: // .NET 8
-                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "APIGateway", "APIGateway");
+                        workingDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "gateways", "gateway-dotnet");
                         command = "cmd.exe";
                         args = $"/c set ASPNETCORE_URLS=http://0.0.0.0:{port} && dotnet run";
                         break;
@@ -79,6 +79,12 @@ namespace GatewayControlPanel
                         CreateNoWindow = true
                     }
                 };
+
+                // Set PORT environment variable for Go gateway
+                if (gatewayType == 1)
+                {
+                    gatewayProcess.StartInfo.EnvironmentVariables["PORT"] = port;
+                }
 
                 gatewayProcess.OutputDataReceived += (s, ev) =>
                 {

@@ -1,0 +1,4 @@
+E:\15. Other\API_Gateway\GatewayControlPanel\publish\GatewayControlPanel.exe
+E:\15. Other\API_Gateway\GatewayControlPanel\publish\GatewayControlPanel.exe.config
+E:\15. Other\API_Gateway\GatewayControlPanel\publish\GatewayControlPanel.pdb
+E:\15. Other\API_Gateway\GatewayControlPanel\publish\Newtonsoft.Json.dll

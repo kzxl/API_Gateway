@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { Form, Input, Button, Card, Typography, App, Space } from 'antd';
-import { UserOutlined, LockOutlined, ApiOutlined } from '@ant-design/icons';
+import { UserOutlined, LockOutlined, ApiOutlined, LinkOutlined } from '@ant-design/icons';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
+import { setApiBaseUrl } from '../api/gatewayApi';
 
 const { Title, Text } = Typography;
 
@@ -19,11 +20,14 @@ export default function Login() {
   const handleLogin = async (values) => {
     setLoading(true);
     try {
+      // Set API base URL before login
+      setApiBaseUrl(values.apiUrl);
+
       await login(values.username, values.password);
       message.success('Login successful');
       navigate('/');
     } catch (err) {
-      message.error(err.response?.data?.error || 'Login failed');
+      message.error(err.response?.data?.error || 'Login failed. Check API URL and credentials.');
     } finally {
       setLoading(false);
     }
@@ -53,8 +57,22 @@ export default function Login() {
         <Form
           onFinish={handleLogin}
           size="large"
-          initialValues={{ username: 'admin', password: 'admin123' }}
+          initialValues={{
+            apiUrl: localStorage.getItem('apiBaseUrl') || 'http://localhost:8887',
+            username: 'admin',
+            password: 'admin123'
+          }}
         >
+          <Form.Item
+            name="apiUrl"
+            rules={[{ required: true, message: 'Please enter API URL' }]}
+          >
+            <Input
+              prefix={<LinkOutlined />}
+              placeholder="API URL (e.g., http://localhost:8887)"
+            />
+          </Form.Item>
+
           <Form.Item
             name="username"
             rules={[{ required: true, message: 'Please enter username' }]}

@@ -1,26 +1,42 @@
 import axios from "axios";
 
-// Using relative path by default to allow Nginx reverse proxy to proxy API calls to Gateway backend
-const API_BASE = import.meta.env.VITE_API_BASE || "http://192.168.19.79:8887";
+// Get API base URL from localStorage or use default
+const getApiBase = () => {
+  return localStorage.getItem('apiBaseUrl') || "http://localhost:8887";
+};
+
 const API_KEY = import.meta.env.VITE_API_KEY || "gw-admin-key-change-me";
 
-const api = axios.create({
-  baseURL: API_BASE,
-  headers: { "X-Api-Key": API_KEY },
-});
+// Create axios instance with dynamic baseURL
+const createApiInstance = () => {
+  const instance = axios.create({
+    baseURL: getApiBase(),
+    headers: { "X-Api-Key": API_KEY },
+  });
 
-// Add Authorization header with access token
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('accessToken');
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
+  // Add Authorization header with access token
+  instance.interceptors.request.use((config) => {
+    const token = localStorage.getItem('accessToken');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  });
+
+  return instance;
+};
+
+let api = createApiInstance();
+let publicApi = axios.create({ baseURL: getApiBase() });
+
+// Function to update API base URL
+export const setApiBaseUrl = (url) => {
+  localStorage.setItem('apiBaseUrl', url);
+  api = createApiInstance();
+  publicApi = axios.create({ baseURL: url });
+};
 
 // ── Auth (public, no API key needed) ──
-const publicApi = axios.create({ baseURL: API_BASE });
-
 export const login = (username, password) =>
   publicApi.post("/auth/login", { username, password });
 export const validateToken = (token) =>

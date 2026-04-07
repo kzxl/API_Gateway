@@ -18,7 +18,7 @@ export default function RoutesPage() {
 
   const load = async () => {
     setLoading(true);
-    try { const res = await getRoutes(); setRoutes(res.data); }
+    try { const res = await getRoutes(); setRoutes(res.data || []); }
     catch { message.error("Failed to load routes"); }
     finally { setLoading(false); }
   };
