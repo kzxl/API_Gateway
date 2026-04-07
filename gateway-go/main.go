@@ -82,17 +82,61 @@ type Destination struct {
 }
 
 // Metrics
-type Metrics struct {
-	TotalRequests   int64
-	SuccessRequests int64
-	FailedRequests  int64
-	TotalLatency    int64
-	WSConnections   int64
-	WSMessages      int64
-	StartTime       time.Time
+type RouteMetrics struct {
+	TotalRequests       int64   `json:"totalRequests"`
+	SuccessCount        int64   `json:"successCount"`
+	ErrorCount          int64   `json:"errorCount"`
+	TotalLatencyMs      int64   `json:"-"`
+	AvgLatencyMs        int     `json:"avgLatencyMs"`
+	MaxLatencyMs        int     `json:"maxLatencyMs"`
+	ThroughputPerSecond float64 `json:"throughputPerSecond"`
+	ErrorRate           float64 `json:"errorRate"`
+	UptimeSeconds       int64   `json:"uptimeSeconds"`
 }
 
-var metrics = &Metrics{StartTime: time.Now()}
+type GlobalMetrics struct {
+	WSConnections int64
+	WSMessages    int64
+	StartTime     time.Time
+}
+
+var globalMetrics = &GlobalMetrics{StartTime: time.Now()}
+var routeMetricsMap = make(map[string]*RouteMetrics)
+var routeMetricsMu sync.RWMutex
+
+// Logs
+type LogEntry struct {
+	Timestamp  time.Time
+	Method     string
+	Path       string
+	StatusCode int
+	LatencyMs  int
+	ClientIp   string
+	RouteId    string
+}
+
+var logQueue = make(chan LogEntry, 2000)
+var logWorkerStarted = false
+
+func logWorker() {
+	for entry := range logQueue {
+		if db == nil {
+			continue
+		}
+		_, err := db.Exec("INSERT INTO RequestLogs (Timestamp, Method, Path, StatusCode, LatencyMs, ClientIp, RouteId) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			entry.Timestamp.Format(time.RFC3339),
+			entry.Method,
+			entry.Path,
+			entry.StatusCode,
+			entry.LatencyMs,
+			entry.ClientIp,
+			entry.RouteId,
+		)
+		if err != nil {
+			log.Printf("⚠️ Failed to write log to DB: %v", err)
+		}
+	}
+}
 
 // Database
 var db *sql.DB
@@ -123,6 +167,12 @@ func main() {
 		log.Println("✅ Log file initialized: gateway.log")
 	} else {
 		log.Println("⚠️ Failed to initialize log file, using default stdout")
+	}
+
+	// Start log worker
+	if !logWorkerStarted {
+		go logWorker()
+		logWorkerStarted = true
 	}
 
 	// Initialize cache
@@ -166,8 +216,12 @@ func main() {
 	admin.HandleFunc("/clusters/{id}", deleteClusterHandler).Methods("DELETE")
 
 	admin.HandleFunc("/metrics", metricsHandler).Methods("GET")
+	admin.HandleFunc("/metrics", resetMetricsHandler).Methods("DELETE")
 	admin.HandleFunc("/stats", statsHandler).Methods("GET")
 	admin.HandleFunc("/health", healthHandler).Methods("GET")
+	admin.HandleFunc("/logs", getLogsHandler).Methods("GET")
+	admin.HandleFunc("/logs", clearLogsHandler).Methods("DELETE")
+	admin.HandleFunc("/logs/stats", getLogStatsHandler).Methods("GET")
 
 	// Setup proxy routes
 	setupProxyRoutes(r)
@@ -268,6 +322,16 @@ func createTables() {
 			LockedUntil TEXT,
 			CreatedAt TEXT DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS RequestLogs (
+			Id INTEGER PRIMARY KEY AUTOINCREMENT,
+			Timestamp TEXT,
+			Method TEXT,
+			Path TEXT,
+			StatusCode INTEGER,
+			LatencyMs INTEGER,
+			ClientIp TEXT,
+			RouteId TEXT
+		)`,
 		`CREATE TABLE IF NOT EXISTS Routes (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			RouteId TEXT UNIQUE NOT NULL,
@@ -327,22 +391,73 @@ func seedData() {
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		originalPath := r.URL.Path
 
-		// Wrap response writer to capture status code
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		
+		clientIp := r.Header.Get("X-Forwarded-For")
+		if clientIp == "" {
+			clientIp = r.RemoteAddr
+			if strings.Contains(clientIp, ":") {
+				clientIp = strings.Split(clientIp, ":")[0]
+			}
+		}
 
 		next.ServeHTTP(wrapped, r)
 
 		latency := time.Since(start).Milliseconds()
+		routeID := r.Header.Get("X-Gateway-RouteId")
+		if routeID == "" {
+			routeID = "Unknown"
+		}
 
-		atomic.AddInt64(&metrics.TotalRequests, 1)
-		atomic.AddInt64(&metrics.TotalLatency, latency)
+		select {
+		case logQueue <- LogEntry{
+			Timestamp:  time.Now(),
+			Method:     r.Method,
+			Path:       originalPath,
+			StatusCode: wrapped.statusCode,
+			LatencyMs:  int(latency),
+			ClientIp:   clientIp,
+			RouteId:    routeID,
+		}:
+		default:
+		}
+
+		routeMetricsMu.Lock()
+		m, ok := routeMetricsMap[routeID]
+		if !ok {
+			m = &RouteMetrics{}
+			routeMetricsMap[routeID] = m
+		}
+		
+		m.TotalRequests++
+		m.TotalLatencyMs += latency
+		
+		if int(latency) > m.MaxLatencyMs {
+			m.MaxLatencyMs = int(latency)
+		}
+
+		if m.TotalRequests > 0 {
+			m.AvgLatencyMs = int(m.TotalLatencyMs / m.TotalRequests)
+		}
+
+		uptime := int64(time.Since(globalMetrics.StartTime).Seconds())
+		m.UptimeSeconds = uptime
+		if uptime > 0 {
+			m.ThroughputPerSecond = float64(m.TotalRequests) / float64(uptime)
+		}
 
 		if wrapped.statusCode < 400 {
-			atomic.AddInt64(&metrics.SuccessRequests, 1)
+			m.SuccessCount++
 		} else {
-			atomic.AddInt64(&metrics.FailedRequests, 1)
+			m.ErrorCount++
 		}
+
+		if m.TotalRequests > 0 {
+			m.ErrorRate = (float64(m.ErrorCount) / float64(m.TotalRequests)) * 100
+		}
+		routeMetricsMu.Unlock()
 	})
 }
 
@@ -438,8 +553,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"status":        "ok",
 		"timestamp":     time.Now().Format(time.RFC3339),
-		"uptime":        int(time.Since(metrics.StartTime).Seconds()),
-		"wsConnections": atomic.LoadInt64(&metrics.WSConnections),
+		"uptime":        int(time.Since(globalMetrics.StartTime).Seconds()),
+		"wsConnections": atomic.LoadInt64(&globalMetrics.WSConnections),
         "gateway": map[string]interface{}{
             "totalRoutes": totalRoutes,
             "totalClusters": totalClusters,
@@ -1088,33 +1203,140 @@ func deleteClusterHandler(w http.ResponseWriter, r *http.Request) {
 
 // Metrics handlers
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	total := atomic.LoadInt64(&metrics.TotalRequests)
-	success := atomic.LoadInt64(&metrics.SuccessRequests)
-	failed := atomic.LoadInt64(&metrics.FailedRequests)
-	latency := atomic.LoadInt64(&metrics.TotalLatency)
+	routeMetricsMu.RLock()
+	defer routeMetricsMu.RUnlock()
 
-	avgLatency := int64(0)
-	if total > 0 {
-		avgLatency = latency / total
-	}
-
-	successRate := float64(0)
-	if total > 0 {
-		successRate = float64(success) / float64(total) * 100
+	routesMap := make(map[string]RouteMetrics)
+	for k, v := range routeMetricsMap {
+		routesMap[k] = *v
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"totalRequests":   total,
-		"successRequests": success,
-		"failedRequests":  failed,
-		"successRate":     fmt.Sprintf("%.2f", successRate),
-		"avgLatency":      avgLatency,
-		"wsConnections":   atomic.LoadInt64(&metrics.WSConnections),
-		"wsMessages":      atomic.LoadInt64(&metrics.WSMessages),
-		"uptime":          int(time.Since(metrics.StartTime).Seconds()),
-		"timestamp":       time.Now().Format(time.RFC3339),
+		"routes":        routesMap,
+		"wsConnections": atomic.LoadInt64(&globalMetrics.WSConnections),
+		"wsMessages":    atomic.LoadInt64(&globalMetrics.WSMessages),
+		"timestamp":     time.Now().Format(time.RFC3339),
 	})
 }
+
+func resetMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	routeMetricsMu.Lock()
+	routeMetricsMap = make(map[string]*RouteMetrics)
+	routeMetricsMu.Unlock()
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func getLogsHandler(w http.ResponseWriter, r *http.Request) {
+	page := 1
+	pageSize := 50
+	
+	if p := r.URL.Query().Get("page"); p != "" {
+		fmt.Sscanf(p, "%d", &page)
+	}
+	if ps := r.URL.Query().Get("pageSize"); ps != "" {
+		fmt.Sscanf(ps, "%d", &pageSize)
+	}
+	
+	offset := (page - 1) * pageSize
+
+	whereClauses := []string{"1=1"}
+	var args []interface{}
+
+	if routeId := r.URL.Query().Get("routeId"); routeId != "" {
+		whereClauses = append(whereClauses, "RouteId = ?")
+		args = append(args, routeId)
+	}
+	if method := r.URL.Query().Get("method"); method != "" {
+		whereClauses = append(whereClauses, "Method = ?")
+		args = append(args, method)
+	}
+	if sc := r.URL.Query().Get("statusCode"); sc != "" {
+		whereClauses = append(whereClauses, "StatusCode = ?")
+		args = append(args, sc)
+	}
+
+	whereQuery := strings.Join(whereClauses, " AND ")
+
+	var total int
+	db.QueryRow("SELECT COUNT(*) FROM RequestLogs WHERE " + whereQuery, args...).Scan(&total)
+
+	query := "SELECT Id, Timestamp, Method, Path, StatusCode, LatencyMs, ClientIp, RouteId FROM RequestLogs WHERE " + whereQuery + " ORDER BY Id DESC LIMIT ? OFFSET ?"
+	args = append(args, pageSize, offset)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var logs []map[string]interface{}
+	for rows.Next() {
+		var id, statusCode, latency int
+		var ts, method, path, clientIp, routeId string
+		
+		rows.Scan(&id, &ts, &method, &path, &statusCode, &latency, &clientIp, &routeId)
+		
+		logs = append(logs, map[string]interface{}{
+			"id":         id,
+			"timestamp":  ts,
+			"method":     method,
+			"path":       path,
+			"statusCode": statusCode,
+			"latencyMs":  latency,
+			"clientIp":   clientIp,
+			"routeId":    routeId,
+		})
+	}
+	
+	if logs == nil {
+		logs = []map[string]interface{}{}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"total": total,
+		"logs":  logs,
+		"page":  page,
+	})
+}
+
+func clearLogsHandler(w http.ResponseWriter, r *http.Request) {
+	db.Exec("DELETE FROM RequestLogs")
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func getLogStatsHandler(w http.ResponseWriter, r *http.Request) {
+	var total int
+	db.QueryRow("SELECT COUNT(*) FROM RequestLogs").Scan(&total)
+
+	var last24h int
+	db.QueryRow("SELECT COUNT(*) FROM RequestLogs WHERE Timestamp >= date('now', '-1 day')").Scan(&last24h)
+
+	type StatusStat struct {
+		StatusGroup string `json:"statusGroup"`
+		Count       int    `json:"count"`
+	}
+	var byStatus []StatusStat
+
+	rows, err := db.Query("SELECT CASE WHEN StatusCode >= 200 AND StatusCode <= 299 THEN '2xx Success' WHEN StatusCode >= 300 AND StatusCode <= 399 THEN '3xx Redirection' WHEN StatusCode >= 400 AND StatusCode <= 499 THEN '4xx Client Error' WHEN StatusCode >= 500 AND StatusCode <= 599 THEN '5xx Server Error' ELSE 'Other' END as StatusGroup, COUNT(*) FROM RequestLogs GROUP BY StatusGroup ORDER BY StatusGroup")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var sg string
+			var count int
+			rows.Scan(&sg, &count)
+			byStatus = append(byStatus, StatusStat{StatusGroup: sg, Count: count})
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"total":    total,
+		"last24h":  last24h,
+		"byStatus": byStatus,
+	})
+}
+
+
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	var routeCount, clusterCount, userCount int
@@ -1126,8 +1348,8 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		"totalRoutes":    routeCount,
 		"totalClusters":  clusterCount,
 		"totalUsers":     userCount,
-		"wsConnections":  atomic.LoadInt64(&metrics.WSConnections),
-		"uptime":         int(time.Since(metrics.StartTime).Seconds()),
+		"wsConnections":  atomic.LoadInt64(&globalMetrics.WSConnections),
+		"uptime":         int(time.Since(globalMetrics.StartTime).Seconds()),
 	})
 }
 
@@ -1203,6 +1425,7 @@ func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	routeID := matchedRoute["routeId"].(string)
+	req.Header.Set("X-Gateway-RouteId", routeID)
 	clusterID := matchedRoute["clusterId"].(string)
 	
 	rateLimit := 0
