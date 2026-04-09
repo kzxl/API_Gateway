@@ -1,6 +1,6 @@
 is_global = true
 build_property.RootNamespace = GatewayControlPanel
-build_property.ProjectDir = E:\15. Other\API_Gateway\GatewayControlPanel\
+build_property.ProjectDir = e:\15. Other\API_Gateway\GatewayControlPanel\
 build_property.EnableComHosting = 
 build_property.EnableGeneratedComInterfaceComImportInterop = 
 build_property.CsWinRTUseWindowsUIXamlProjections = false

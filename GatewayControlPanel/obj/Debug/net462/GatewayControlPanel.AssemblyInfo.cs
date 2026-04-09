@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("GatewayControlPanel")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d14f5a281fa26737dd2fd205d41827fbb8bc84ae")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+417501e39193dcba44b466143817472fc55b670f")]
 [assembly: System.Reflection.AssemblyProductAttribute("GatewayControlPanel")]
 [assembly: System.Reflection.AssemblyTitleAttribute("GatewayControlPanel")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

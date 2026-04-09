@@ -74,8 +74,8 @@ namespace GatewayControlPanel
                         Arguments = args,
                         WorkingDirectory = workingDir,
                         UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
+                        RedirectStandardOutput = false,
+                        RedirectStandardError = false,
                         CreateNoWindow = true
                     }
                 };
@@ -86,31 +86,7 @@ namespace GatewayControlPanel
                     gatewayProcess.StartInfo.EnvironmentVariables["PORT"] = port;
                 }
 
-                gatewayProcess.OutputDataReceived += (s, ev) =>
-                {
-                    if (!string.IsNullOrEmpty(ev.Data))
-                    {
-                        Dispatcher.Invoke(() =>
-                        {
-                            StatusTextBlock.Text += ev.Data + "\n";
-                        });
-                    }
-                };
-
-                gatewayProcess.ErrorDataReceived += (s, ev) =>
-                {
-                    if (!string.IsNullOrEmpty(ev.Data))
-                    {
-                        Dispatcher.Invoke(() =>
-                        {
-                            StatusTextBlock.Text += "[ERROR] " + ev.Data + "\n";
-                        });
-                    }
-                };
-
                 gatewayProcess.Start();
-                gatewayProcess.BeginOutputReadLine();
-                gatewayProcess.BeginErrorReadLine();
 
                 currentGatewayPath = workingDir;
 

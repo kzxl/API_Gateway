@@ -6,11 +6,16 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Performance](https://img.shields.io/badge/throughput-180k%20req%2Fs-brightgreen.svg)](PERFORMANCE_12CPU.md)
 
-**Version:** 2.1.0  
+**Version:** 2.1.1  
 **Status:** ✅ Production Ready  
-**Date:** 2026-04-03
+**Date:** 2026-04-09
 
 ---
+
+## 🔄 Recent Updates (2026-04-09)
+- **GatewayControlPanel**: Upgraded target framework from .NET Framework 4.6.2 to .NET 8.0-Windows.
+- **GatewayControlPanel**: Optimized process execution by disabling standard output/error redirection to avoid UI blocking.
+
 
 ## 📋 Overview
 
@@ -480,5 +485,5 @@ For issues and questions:
 **Made with ❤️ using Universe Architecture**
 
 **Status:** ✅ Production Ready  
-**Version:** 2.1.0  
-**Last Updated:** 2026-04-03
+**Version:** 2.1.1  
+**Last Updated:** 2026-04-09
