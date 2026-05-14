@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import {
-  Table, Card, Tag, Spin, Typography, Button, Space, App, Select, Input, Row, Col, Statistic,
+  Table, Card, Tag, Spin, Typography, Button, Space, App, Select, Input, Row, Col, Statistic, Switch, Skeleton
 } from "antd";
 import {
   ReloadOutlined, DeleteOutlined, FileTextOutlined, ClockCircleOutlined,
@@ -17,6 +17,7 @@ export default function Logs() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({});
+  const [showSystem, setShowSystem] = useState(false);
 
   const load = async (p = page) => {
     setLoading(true);
@@ -41,58 +42,71 @@ export default function Logs() {
     });
   };
 
+  // Process Logs: rename Unknown to System, filter based on showSystem
+  const processedLogs = logs
+    .map(l => ({ ...l, routeId: l.routeId === "Unknown" ? "System" : l.routeId }))
+    .filter(l => showSystem || l.routeId !== "System");
+
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <Title level={3} style={{ margin: 0 }}>Request Logs</Title>
-        <Space>
+        <Space wrap>
+          <Switch 
+            checkedChildren="System: ON" 
+            unCheckedChildren="System: OFF" 
+            checked={showSystem} 
+            onChange={setShowSystem} 
+          />
           <Button icon={<ReloadOutlined />} onClick={() => load()}>Refresh</Button>
           <Button danger icon={<DeleteOutlined />} onClick={handleClear}>Clear</Button>
         </Space>
       </div>
 
-      {stats && (
-        <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-          <Col xs={12} sm={6}><Card hoverable><Statistic title="Total Logs" value={stats.total} prefix={<FileTextOutlined />} /></Card></Col>
-          <Col xs={12} sm={6}><Card hoverable><Statistic title="Last 24h" value={stats.last24h} prefix={<ClockCircleOutlined />} /></Card></Col>
-          {stats.byStatus?.map((s) => (
-            <Col xs={12} sm={6} key={s.statusGroup}>
-              <Card hoverable>
-                <Statistic title={s.statusGroup} value={s.count}
-                  valueStyle={{ color: s.statusGroup.startsWith("2") ? "#52c41a" : s.statusGroup.startsWith("4") ? "#fa8c16" : "#ff4d4f" }} />
-              </Card>
-            </Col>
-          ))}
-        </Row>
-      )}
+      <Skeleton loading={loading && !stats} active paragraph={{ rows: 3 }}>
+        {stats && (
+          <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+            <Col xs={12} sm={6}><Card hoverable><Statistic title="Total Logs (All)" value={stats.total} prefix={<FileTextOutlined />} /></Card></Col>
+            <Col xs={12} sm={6}><Card hoverable><Statistic title="Last 24h (All)" value={stats.last24h} prefix={<ClockCircleOutlined />} /></Card></Col>
+            {stats.byStatus?.map((s) => (
+              <Col xs={12} sm={6} key={s.statusGroup}>
+                <Card hoverable>
+                  <Statistic title={s.statusGroup} value={s.count}
+                    valueStyle={{ color: s.statusGroup.startsWith("2") ? "#52c41a" : s.statusGroup.startsWith("4") ? "#fa8c16" : "#ff4d4f" }} />
+                </Card>
+              </Col>
+            ))}
+          </Row>
+        )}
 
-      <Card size="small" style={{ marginBottom: 16 }}>
-        <Space wrap>
-          <Select placeholder="Method" allowClear style={{ width: 100 }}
-            onChange={(v) => setFilters((f) => ({ ...f, method: v }))}>
-            {["GET", "POST", "PUT", "DELETE"].map((m) => <Select.Option key={m}>{m}</Select.Option>)}
-          </Select>
-          <Input placeholder="Route ID" allowClear style={{ width: 150 }}
-            onChange={(e) => setFilters((f) => ({ ...f, routeId: e.target.value || undefined }))} />
-          <Select placeholder="Status" allowClear style={{ width: 100 }}
-            onChange={(v) => setFilters((f) => ({ ...f, statusCode: v }))}>
-            {[200, 301, 400, 401, 403, 404, 429, 500, 502, 503].map((s) => <Select.Option key={s}>{s}</Select.Option>)}
-          </Select>
-        </Space>
-      </Card>
+        <Card size="small" style={{ marginBottom: 16 }}>
+          <Space wrap>
+            <Select placeholder="Method" allowClear style={{ width: 100 }}
+              onChange={(v) => setFilters((f) => ({ ...f, method: v }))}>
+              {["GET", "POST", "PUT", "DELETE"].map((m) => <Select.Option key={m}>{m}</Select.Option>)}
+            </Select>
+            <Input placeholder="Route ID" allowClear style={{ width: 150 }}
+              onChange={(e) => setFilters((f) => ({ ...f, routeId: e.target.value || undefined }))} />
+            <Select placeholder="Status" allowClear style={{ width: 100 }}
+              onChange={(v) => setFilters((f) => ({ ...f, statusCode: v }))}>
+              {[200, 301, 400, 401, 403, 404, 429, 500, 502, 503].map((s) => <Select.Option key={s}>{s}</Select.Option>)}
+            </Select>
+          </Space>
+        </Card>
 
-      <Table dataSource={logs} rowKey="id" loading={loading} size="small"
-        pagination={{ current: page, total, pageSize: 50, onChange: (p) => { setPage(p); load(p); } }}
-        columns={[
-          { title: "Time", dataIndex: "timestamp", width: 180, render: (v) => new Date(v).toLocaleString() },
-          { title: "Method", dataIndex: "method", width: 80, render: (v) => <Tag color={v === "GET" ? "blue" : v === "POST" ? "green" : v === "DELETE" ? "red" : "orange"}>{v}</Tag> },
-          { title: "Path", dataIndex: "path", ellipsis: true },
-          { title: "Status", dataIndex: "statusCode", width: 80, render: (v) => <Tag color={v < 300 ? "green" : v < 400 ? "blue" : v < 500 ? "orange" : "red"}>{v}</Tag> },
-          { title: "Latency", dataIndex: "latencyMs", width: 100, render: (v) => `${v} ms` },
-          { title: "Client IP", dataIndex: "clientIp", width: 130 },
-          { title: "Route", dataIndex: "routeId", width: 130, render: (v) => <Tag>{v}</Tag> },
-        ]}
-      />
+        <Table dataSource={processedLogs} rowKey="id" loading={loading} size="small"
+          pagination={{ current: page, total, pageSize: 50, onChange: (p) => { setPage(p); load(p); } }}
+          columns={[
+            { title: "Time", dataIndex: "timestamp", width: 180, render: (v) => new Date(v).toLocaleString() },
+            { title: "Method", dataIndex: "method", width: 80, render: (v) => <Tag color={v === "GET" ? "blue" : v === "POST" ? "green" : v === "DELETE" ? "red" : "orange"}>{v}</Tag> },
+            { title: "Path", dataIndex: "path", ellipsis: true },
+            { title: "Status", dataIndex: "statusCode", width: 80, render: (v) => <Tag color={v < 300 ? "green" : v < 400 ? "blue" : v < 500 ? "orange" : "red"}>{v}</Tag> },
+            { title: "Latency", dataIndex: "latencyMs", width: 100, render: (v) => `${v} ms` },
+            { title: "Client IP", dataIndex: "clientIp", width: 130 },
+            { title: "Route", dataIndex: "routeId", width: 130, render: (v) => <Tag color={v === "System" ? "red" : "default"}>{v}</Tag> },
+          ]}
+        />
+      </Skeleton>
     </div>
   );
 }

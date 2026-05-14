@@ -39,13 +39,24 @@ export default function Login() {
       justifyContent: 'center',
       alignItems: 'center',
       minHeight: '100vh',
-      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
+      background: 'linear-gradient(135deg, #09090b 0%, #1a1a2e 50%, #16213e 100%)',
+      position: 'relative',
+      overflow: 'hidden'
     }}>
+      {/* Decorative blurred circles for premium feel */}
+      <div style={{ position: 'absolute', width: 400, height: 400, background: 'rgba(22, 119, 255, 0.15)', borderRadius: '50%', filter: 'blur(80px)', top: '-10%', left: '-10%' }} />
+      <div style={{ position: 'absolute', width: 300, height: 300, background: 'rgba(114, 46, 209, 0.15)', borderRadius: '50%', filter: 'blur(80px)', bottom: '-10%', right: '-10%' }} />
+      
       <Card
         style={{
           width: 420,
-          boxShadow: '0 8px 32px rgba(0,0,0,0.1)',
-          borderRadius: 8
+          background: 'rgba(22, 27, 34, 0.55)',
+          backdropFilter: 'blur(16px)',
+          WebkitBackdropFilter: 'blur(16px)',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.3), inset 0 0 0 1px rgba(255,255,255,0.05)',
+          borderRadius: 16,
+          border: 'none',
+          zIndex: 1
         }}
       >
         <div style={{ textAlign: 'center', marginBottom: 32 }}>

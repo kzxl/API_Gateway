@@ -12,7 +12,9 @@
 
 ---
 
-## 🔄 Recent Updates (2026-04-09)
+## 🔄 Recent Updates (2026-05-14)
+- **Gateway Admin UI**: Upgraded Admin dashboard UX/UI with premium glassmorphism dark/light mode, real-time traffic line charts, auto-refresh intervals, and advanced routing filters for System requests.
+- **IIS Deployment**: Fixed React SPA routing on IIS 10 with web.config URL rewrite rules.
 - **GatewayControlPanel**: Upgraded target framework from .NET Framework 4.6.2 to .NET 8.0-Windows.
 - **GatewayControlPanel**: Optimized process execution by disabling standard output/error redirection to avoid UI blocking.
 
