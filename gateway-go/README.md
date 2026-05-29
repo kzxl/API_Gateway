@@ -8,10 +8,12 @@
 
 Lightweight API Gateway built with Go, featuring:
 - 🚀 **250k-350k req/s** throughput (single instance with cache)
-- 💾 **GoCache L1 In-Memory Caching** (85-95% hit rate)
-- 🔐 JWT Authentication
-- 📊 Real-time metrics
-- 🔌 HTTP proxy forwarding
+- 💾 **L1 In-Memory Caching** (85-95% hit rate)
+- 🔐 JWT Authentication with **working access + refresh token rotation**
+- ♻️ Cached reverse proxies + tuned HTTP connection pooling
+- 🧹 **Automatic request-log retention/cleanup**
+- 📊 Real-time metrics (lock-free hot path)
+- 🔌 HTTP proxy forwarding + WebSocket support
 - 💾 SQLite database
 - 🖥️ Windows Server 2012 compatible
 
@@ -104,11 +106,46 @@ See [GOCACHE_PERFORMANCE_ANALYSIS.md](../GOCACHE_PERFORMANCE_ANALYSIS.md) for de
 
 ## 🔧 Configuration
 
-**.env file:**
+Configuration is read from environment variables (loadable via a `.env` file in
+your process manager / docker-compose):
+
 ```env
+# Server
 PORT=8887
-JWT_SECRET=your-secret-key-min-32-chars
+JWT_SECRET=your-secret-key-min-32-chars   # CHANGE THIS in production
+
+# Token lifetimes
+ACCESS_TOKEN_TTL_MIN=15                    # access token validity (minutes)
+REFRESH_TOKEN_TTL_HOURS=168                # refresh token validity (hours, default 7 days)
+
+# Request-log retention (automatic cleanup)
+LOG_RETENTION_DAYS=7                       # delete logs older than N days (0 = disable)
+LOG_CLEANUP_INTERVAL_HOURS=6               # how often the cleanup worker runs
 ```
+
+> ⚠️ **Security:** always override `JWT_SECRET` and restrict CORS before going
+> to production. The shipped default secret is a placeholder only.
+
+---
+
+## 🧹 Log Retention / Auto-Cleanup
+
+Request logs are written asynchronously to SQLite. To keep the database light,
+a background worker automatically purges old entries:
+
+- Runs once shortly after startup, then every `LOG_CLEANUP_INTERVAL_HOURS`.
+- Deletes rows older than `LOG_RETENTION_DAYS`.
+- Set `LOG_RETENTION_DAYS=0` to disable automatic cleanup entirely.
+
+Manual cleanup is also available via the admin API:
+
+```
+DELETE /admin/logs                     - clear ALL logs
+DELETE /admin/logs?olderThanDays=30    - clear only logs older than 30 days
+```
+
+The admin UI (Logs page) shows the current retention status and offers a
+"Clear" dropdown (older than 1 / 7 / 30 days, or all).
 
 ---
 
@@ -116,9 +153,10 @@ JWT_SECRET=your-secret-key-min-32-chars
 
 ### **Authentication**
 ```
-POST   /auth/login          - Login
-POST   /auth/refresh        - Refresh token
-POST   /auth/logout         - Logout
+POST   /auth/login          - Login, returns access + refresh tokens
+POST   /auth/refresh        - Exchange a valid refresh token for a new token pair
+POST   /auth/validate       - Validate a token and return its claims
+POST   /auth/logout         - Logout (requires auth)
 ```
 
 ### **Management (requires auth)**
@@ -131,6 +169,10 @@ GET    /admin/clusters      - List clusters (cached)
 
 GET    /admin/metrics       - Get metrics
 GET    /admin/stats         - Get stats
+
+GET    /admin/logs          - List request logs (paginated)
+DELETE /admin/logs          - Clear logs (optional ?olderThanDays=N)
+GET    /admin/logs/stats    - Log stats + retention config
 ```
 
 ### **Health Check**
@@ -191,11 +233,15 @@ Latency (p99):  0.8ms
 
 ## 🛡️ Security
 
-- ✅ JWT authentication
+- ✅ JWT authentication with access + refresh token rotation
+- ✅ Signing method pinned to HMAC (prevents alg-confusion attacks)
+- ✅ Access/refresh token type enforcement (refresh tokens rejected on protected routes)
 - ✅ Password hashing (bcrypt)
 - ✅ Account lockout (5 attempts)
 - ✅ Rate limiting
 - ✅ CORS support
+
+> Remember to set a strong `JWT_SECRET` and tighten CORS for production.
 
 ---
 

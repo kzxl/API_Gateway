@@ -12,26 +12,37 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	cache "github.com/patrickmn/go-cache"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
-	_ "modernc.org/sqlite"
+	cache "github.com/patrickmn/go-cache"
 	"github.com/rs/cors"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/time/rate"
+	_ "modernc.org/sqlite"
 )
 
 // Configuration
 var (
 	Port      = getEnv("PORT", "8887")
 	JWTSecret = []byte(getEnv("JWT_SECRET", "GatewaySecretKey-Change-This-In-Production-Min32Chars!"))
+
+	// Token lifetimes (overridable via env, in minutes for access / hours for refresh)
+	AccessTokenTTL  = time.Duration(getEnvInt("ACCESS_TOKEN_TTL_MIN", 15)) * time.Minute
+	RefreshTokenTTL = time.Duration(getEnvInt("REFRESH_TOKEN_TTL_HOURS", 7*24)) * time.Hour
+
+	// Request-log retention. Logs older than LogRetentionDays are purged
+	// automatically every LogCleanupIntervalHours. Set LogRetentionDays<=0 to
+	// disable automatic cleanup.
+	LogRetentionDays        = getEnvInt("LOG_RETENTION_DAYS", 7)
+	LogCleanupIntervalHours = getEnvInt("LOG_CLEANUP_INTERVAL_HOURS", 6)
 )
 
 // Models
@@ -46,12 +57,12 @@ type User struct {
 }
 
 type Route struct {
-	ID                 int64
-	RouteID            string
-	ClusterID          string
-	MatchPath          string
-	RateLimitPerSecond int
-	IsActive           bool
+	ID                            int64
+	RouteID                       string
+	ClusterID                     string
+	MatchPath                     string
+	RateLimitPerSecond            int
+	IsActive                      bool
 	Methods                       string
 	CircuitBreakerThreshold       int
 	CircuitBreakerDurationSeconds int
@@ -62,11 +73,11 @@ type Route struct {
 }
 
 type Cluster struct {
-	ID                  int64
-	ClusterID           string
-	DestinationsJSON    string
-	LoadBalancingPolicy string
-	IsActive            bool
+	ID                         int64
+	ClusterID                  string
+	DestinationsJSON           string
+	LoadBalancingPolicy        string
+	IsActive                   bool
 	EnableHealthCheck          int
 	HealthCheckPath            string
 	HealthCheckIntervalSeconds int
@@ -94,6 +105,16 @@ type RouteMetrics struct {
 	UptimeSeconds       int64   `json:"uptimeSeconds"`
 }
 
+// routeStat holds lock-free atomic counters updated on the request hot path.
+// Derived values (avg, throughput, error rate) are computed at read time.
+type routeStat struct {
+	total        int64
+	success      int64
+	errCount     int64
+	totalLatency int64
+	maxLatency   int64
+}
+
 type GlobalMetrics struct {
 	WSConnections int64
 	WSMessages    int64
@@ -101,8 +122,7 @@ type GlobalMetrics struct {
 }
 
 var globalMetrics = &GlobalMetrics{StartTime: time.Now()}
-var routeMetricsMap = make(map[string]*RouteMetrics)
-var routeMetricsMu sync.RWMutex
+var routeMetricsMap sync.Map // map[string]*routeStat
 
 // Logs
 type LogEntry struct {
@@ -138,18 +158,97 @@ func logWorker() {
 	}
 }
 
+// purgeOldLogs deletes request logs older than LogRetentionDays. Returns the
+// number of rows removed.
+func purgeOldLogs() (int64, error) {
+	if db == nil || LogRetentionDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -LogRetentionDays).Format(time.RFC3339)
+	res, err := db.Exec("DELETE FROM RequestLogs WHERE Timestamp < ?", cutoff)
+	if err != nil {
+		return 0, err
+	}
+	rows, _ := res.RowsAffected()
+	return rows, nil
+}
+
+// logRetentionWorker periodically purges old request logs so the DB stays light.
+// Disabled when LogRetentionDays<=0.
+func logRetentionWorker() {
+	if LogRetentionDays <= 0 {
+		log.Println("ℹ️ Log auto-cleanup disabled (LOG_RETENTION_DAYS<=0)")
+		return
+	}
+	interval := time.Duration(LogCleanupIntervalHours) * time.Hour
+	if interval <= 0 {
+		interval = 6 * time.Hour
+	}
+
+	log.Printf("🧹 Log auto-cleanup enabled: keep %d day(s), run every %v\n", LogRetentionDays, interval)
+
+	// Run once shortly after startup, then on a ticker.
+	if n, err := purgeOldLogs(); err != nil {
+		log.Printf("⚠️ Log cleanup failed: %v", err)
+	} else if n > 0 {
+		log.Printf("🧹 Log cleanup: removed %d old log entries", n)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if n, err := purgeOldLogs(); err != nil {
+			log.Printf("⚠️ Log cleanup failed: %v", err)
+		} else if n > 0 {
+			log.Printf("🧹 Log cleanup: removed %d old log entries", n)
+		}
+	}
+}
+
 // Database
 var db *sql.DB
 
 // Cache (L1 - In-Memory)
 var (
-	routeCache    *cache.Cache
-	clusterCache  *cache.Cache
-	userCache     *cache.Cache
+	routeCache   *cache.Cache
+	clusterCache *cache.Cache
+	userCache    *cache.Cache
 )
 
 // Rate limiters
 var rateLimiters sync.Map
+
+// Shared, tuned HTTP transport for all upstream proxying. Reusing one transport
+// keeps the connection pool warm instead of relying on per-request defaults.
+var proxyTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	MaxIdleConns:          1000,
+	MaxIdleConnsPerHost:   200,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+}
+
+// proxyCache holds one *httputil.ReverseProxy per upstream target so we don't
+// allocate a fresh proxy on every request (a hot-path bottleneck).
+var proxyCache sync.Map // map[string]*httputil.ReverseProxy
+
+// getReverseProxy returns a cached reverse proxy for the given target URL,
+// creating and storing one on first use.
+func getReverseProxy(target *url.URL) *httputil.ReverseProxy {
+	key := target.Scheme + "://" + target.Host
+	if p, ok := proxyCache.Load(key); ok {
+		return p.(*httputil.ReverseProxy)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = proxyTransport
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		respondJSON(w, http.StatusBadGateway, map[string]string{"error": "Upstream request failed"})
+	}
+	actual, _ := proxyCache.LoadOrStore(key, proxy)
+	return actual.(*httputil.ReverseProxy)
+}
 
 // WebSocket upgrader
 var upgrader = websocket.Upgrader{
@@ -182,6 +281,9 @@ func main() {
 	initDB()
 	defer db.Close()
 
+	// Start background log retention/cleanup worker
+	go logRetentionWorker()
+
 	// Create router
 	r := mux.NewRouter()
 
@@ -194,6 +296,7 @@ func main() {
 	// Auth endpoints
 	r.HandleFunc("/auth/login", loginHandler).Methods("POST")
 	r.HandleFunc("/auth/refresh", refreshHandler).Methods("POST")
+	r.HandleFunc("/auth/validate", validateHandler).Methods("POST")
 	r.Handle("/auth/logout", authMiddleware(http.HandlerFunc(logoutHandler))).Methods("POST")
 
 	// Admin endpoints (require auth)
@@ -236,11 +339,15 @@ func main() {
 
 	// Start server
 	srv := &http.Server{
-		Addr:         "0.0.0.0:" + Port,
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:    "0.0.0.0:" + Port,
+		Handler: handler,
+		// ReadHeaderTimeout guards against slowloris while allowing slow bodies.
+		ReadHeaderTimeout: 15 * time.Second,
+		// WriteTimeout is intentionally 0: this is a proxy that supports
+		// WebSocket upgrades and long/streaming upstream responses, which a
+		// fixed write deadline would abruptly cut off.
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Graceful shutdown
@@ -271,9 +378,9 @@ func main() {
 // Cache initialization
 func initCache() {
 	// L1 Cache: In-Memory with TTL
-	routeCache = cache.New(5*time.Minute, 10*time.Minute)    // Routes: 5min TTL
-	clusterCache = cache.New(1*time.Minute, 2*time.Minute)   // Clusters: 1min TTL
-	userCache = cache.New(2*time.Minute, 5*time.Minute)      // Users: 2min TTL
+	routeCache = cache.New(5*time.Minute, 10*time.Minute)  // Routes: 5min TTL
+	clusterCache = cache.New(1*time.Minute, 2*time.Minute) // Clusters: 1min TTL
+	userCache = cache.New(2*time.Minute, 5*time.Minute)    // Users: 2min TTL
 
 	log.Println("✅ Cache initialized (L1 In-Memory)")
 }
@@ -332,6 +439,7 @@ func createTables() {
 			ClientIp TEXT,
 			RouteId TEXT
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_requestlogs_timestamp ON RequestLogs(Timestamp)`,
 		`CREATE TABLE IF NOT EXISTS Routes (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			RouteId TEXT UNIQUE NOT NULL,
@@ -394,7 +502,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		originalPath := r.URL.Path
 
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		
+
 		clientIp := r.Header.Get("X-Forwarded-For")
 		if clientIp == "" {
 			clientIp = r.RemoteAddr
@@ -424,40 +532,29 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		default:
 		}
 
-		routeMetricsMu.Lock()
-		m, ok := routeMetricsMap[routeID]
-		if !ok {
-			m = &RouteMetrics{}
-			routeMetricsMap[routeID] = m
-		}
-		
-		m.TotalRequests++
-		m.TotalLatencyMs += latency
-		
-		if int(latency) > m.MaxLatencyMs {
-			m.MaxLatencyMs = int(latency)
-		}
-
-		if m.TotalRequests > 0 {
-			m.AvgLatencyMs = int(m.TotalLatencyMs / m.TotalRequests)
-		}
-
-		uptime := int64(time.Since(globalMetrics.StartTime).Seconds())
-		m.UptimeSeconds = uptime
-		if uptime > 0 {
-			m.ThroughputPerSecond = float64(m.TotalRequests) / float64(uptime)
-		}
-
-		if wrapped.statusCode < 400 {
-			m.SuccessCount++
+		// Lock-free metrics update on the hot path.
+		var st *routeStat
+		if v, ok := routeMetricsMap.Load(routeID); ok {
+			st = v.(*routeStat)
 		} else {
-			m.ErrorCount++
+			actual, _ := routeMetricsMap.LoadOrStore(routeID, &routeStat{})
+			st = actual.(*routeStat)
 		}
 
-		if m.TotalRequests > 0 {
-			m.ErrorRate = (float64(m.ErrorCount) / float64(m.TotalRequests)) * 100
+		atomic.AddInt64(&st.total, 1)
+		atomic.AddInt64(&st.totalLatency, latency)
+		if wrapped.statusCode < 400 {
+			atomic.AddInt64(&st.success, 1)
+		} else {
+			atomic.AddInt64(&st.errCount, 1)
 		}
-		routeMetricsMu.Unlock()
+		// Lock-free max update via compare-and-swap.
+		for {
+			cur := atomic.LoadInt64(&st.maxLatency)
+			if latency <= cur || atomic.CompareAndSwapInt64(&st.maxLatency, cur, latency) {
+				break
+			}
+		}
 	})
 }
 
@@ -479,14 +576,23 @@ func authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		tokenString := authHeader[7:] // Remove "Bearer "
+		const prefix = "Bearer "
+		if len(authHeader) <= len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
+			respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid authorization header"})
+			return
+		}
+		tokenString := authHeader[len(prefix):]
 
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			return JWTSecret, nil
-		})
+		claims, err := parseToken(tokenString)
+		if err != nil {
+			// 401 (not 403) so clients know to refresh / re-authenticate
+			respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid or expired token"})
+			return
+		}
 
-		if err != nil || !token.Valid {
-			respondJSON(w, http.StatusForbidden, map[string]string{"error": "Invalid token"})
+		// Reject refresh tokens used as access tokens on protected routes
+		if typ, _ := claims["typ"].(string); typ == "refresh" {
+			respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token type"})
 			return
 		}
 
@@ -496,71 +602,77 @@ func authMiddleware(next http.Handler) http.Handler {
 
 // Handlers
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-    var totalRoutes, activeRoutes int
-    db.QueryRow("SELECT COUNT(*) FROM Routes").Scan(&totalRoutes)
-    db.QueryRow("SELECT COUNT(*) FROM Routes WHERE IsActive = 1").Scan(&activeRoutes)
+	var totalRoutes, activeRoutes int
+	db.QueryRow("SELECT COUNT(*) FROM Routes").Scan(&totalRoutes)
+	db.QueryRow("SELECT COUNT(*) FROM Routes WHERE IsActive = 1").Scan(&activeRoutes)
 
-    var totalClusters int
-    db.QueryRow("SELECT COUNT(*) FROM Clusters").Scan(&totalClusters)
+	var totalClusters int
+	db.QueryRow("SELECT COUNT(*) FROM Clusters").Scan(&totalClusters)
 
-    type healthDest struct {
-        ClusterId                  string `json:"clusterId"`
-        Address                    string `json:"address"`
-        Role                       string `json:"role"`
-        HealthCheck                string `json:"healthCheck"`
-        HealthCheckPath            string `json:"healthCheckPath"`
-        HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
-    }
-    var destinations []healthDest
-    
-    rows, err := db.Query("SELECT ClusterId, DestinationsJson, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds FROM Clusters")
-    if err == nil {
-        defer rows.Close()
-        for rows.Next() {
-            var cid, djson string
+	type healthDest struct {
+		ClusterId                  string `json:"clusterId"`
+		Address                    string `json:"address"`
+		Role                       string `json:"role"`
+		HealthCheck                string `json:"healthCheck"`
+		HealthCheckPath            string `json:"healthCheckPath"`
+		HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
+	}
+	var destinations []healthDest
+
+	rows, err := db.Query("SELECT ClusterId, DestinationsJson, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds FROM Clusters")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var cid, djson string
 			var hpath string = "/health"
-            var eh, hint int = 1, 10
-            
-            // Need nullable scanning for newly added columns
-            var niEh, niHint sql.NullInt64
-            var nsHpath sql.NullString
-            
-            rows.Scan(&cid, &djson, &niEh, &nsHpath, &niHint)
-            
-            if niEh.Valid { eh = int(niEh.Int64) }
-            if nsHpath.Valid { hpath = nsHpath.String }
-            if niHint.Valid { hint = int(niHint.Int64) }
-            
-            var dests []Destination
-            json.Unmarshal([]byte(djson), &dests)
-            for _, d := range dests {
-                healthCheckStr := "Disabled"
-                if eh == 1 {
-                    healthCheckStr = "Enabled"
-                }
-                destinations = append(destinations, healthDest{
-                    ClusterId: cid,
-                    Address: d.Address,
-                    Role: d.Health,
-                    HealthCheck: healthCheckStr,
-                    HealthCheckPath: hpath,
-                    HealthCheckIntervalSeconds: hint,
-                })
-            }
-        }
-    }
+			var eh, hint int = 1, 10
+
+			// Need nullable scanning for newly added columns
+			var niEh, niHint sql.NullInt64
+			var nsHpath sql.NullString
+
+			rows.Scan(&cid, &djson, &niEh, &nsHpath, &niHint)
+
+			if niEh.Valid {
+				eh = int(niEh.Int64)
+			}
+			if nsHpath.Valid {
+				hpath = nsHpath.String
+			}
+			if niHint.Valid {
+				hint = int(niHint.Int64)
+			}
+
+			var dests []Destination
+			json.Unmarshal([]byte(djson), &dests)
+			for _, d := range dests {
+				healthCheckStr := "Disabled"
+				if eh == 1 {
+					healthCheckStr = "Enabled"
+				}
+				destinations = append(destinations, healthDest{
+					ClusterId:                  cid,
+					Address:                    d.Address,
+					Role:                       d.Health,
+					HealthCheck:                healthCheckStr,
+					HealthCheckPath:            hpath,
+					HealthCheckIntervalSeconds: hint,
+				})
+			}
+		}
+	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"status":        "ok",
 		"timestamp":     time.Now().Format(time.RFC3339),
 		"uptime":        int(time.Since(globalMetrics.StartTime).Seconds()),
 		"wsConnections": atomic.LoadInt64(&globalMetrics.WSConnections),
-        "gateway": map[string]interface{}{
-            "totalRoutes": totalRoutes,
-            "totalClusters": totalClusters,
-            "activeProxyRoutes": activeRoutes,
-        },
-        "destinations": destinations,
+		"gateway": map[string]interface{}{
+			"totalRoutes":       totalRoutes,
+			"totalClusters":     totalClusters,
+			"activeProxyRoutes": activeRoutes,
+		},
+		"destinations": destinations,
 	})
 }
 
@@ -597,22 +709,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			userCache.Delete(cacheKey)
 		} else {
 			// Password correct - generate tokens
-			accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-				"id":       user.ID,
-				"username": user.Username,
-				"role":     user.Role,
-				"exp":      time.Now().Add(15 * time.Minute).Unix(),
-			})
-
-			accessTokenString, _ := accessToken.SignedString(JWTSecret)
-
-			refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-				"id":       user.ID,
-				"username": user.Username,
-				"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
-			})
-
-			refreshTokenString, _ := refreshToken.SignedString(JWTSecret)
+			accessTokenString, refreshTokenString, err := generateTokenPair(user.ID, user.Username, user.Role)
+			if err != nil {
+				respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to issue token"})
+				return
+			}
 
 			respondJSON(w, http.StatusOK, map[string]interface{}{
 				"accessToken":  accessTokenString,
@@ -676,22 +777,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	userCache.Set(cacheKey, user, cache.DefaultExpiration)
 
 	// Generate tokens
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"id":       user.ID,
-		"username": user.Username,
-		"role":     user.Role,
-		"exp":      time.Now().Add(15 * time.Minute).Unix(),
-	})
-
-	accessTokenString, _ := accessToken.SignedString(JWTSecret)
-
-	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"id":       user.ID,
-		"username": user.Username,
-		"exp":      time.Now().Add(7 * 24 * time.Hour).Unix(),
-	})
-
-	refreshTokenString, _ := refreshToken.SignedString(JWTSecret)
+	accessTokenString, refreshTokenString, err := generateTokenPair(user.ID, user.Username, user.Role)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to issue token"})
+		return
+	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"accessToken":  accessTokenString,
@@ -705,8 +795,107 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func refreshHandler(w http.ResponseWriter, r *http.Request) {
-	// Simplified refresh implementation
-	respondJSON(w, http.StatusOK, map[string]string{"message": "Refresh token endpoint"})
+	var req struct {
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RefreshToken == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Refresh token required"})
+		return
+	}
+
+	claims, err := parseToken(req.RefreshToken)
+	if err != nil {
+		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid or expired refresh token"})
+		return
+	}
+
+	// Ensure this is actually a refresh token, not an access token being replayed
+	if typ, _ := claims["typ"].(string); typ != "refresh" {
+		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token type"})
+		return
+	}
+
+	idFloat, ok := claims["id"].(float64)
+	if !ok {
+		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token claims"})
+		return
+	}
+	userID := int64(idFloat)
+
+	// Re-load the user to pick up current role / active status (token rotation)
+	var user User
+	err = db.QueryRow(`SELECT Id, Username, Role, IsActive FROM Users WHERE Id = ?`, userID).Scan(
+		&user.ID, &user.Username, &user.Role, &user.IsActive)
+	if err != nil {
+		respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "User not found"})
+		return
+	}
+	if !user.IsActive {
+		respondJSON(w, http.StatusForbidden, map[string]string{"error": "Account disabled"})
+		return
+	}
+
+	accessTokenString, refreshTokenString, err := generateTokenPair(user.ID, user.Username, user.Role)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to issue token"})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"accessToken":  accessTokenString,
+		"refreshToken": refreshTokenString,
+		"user": map[string]interface{}{
+			"id":       user.ID,
+			"username": user.Username,
+			"role":     user.Role,
+		},
+	})
+}
+
+// validateHandler lets the UI check a token on mount and read back its claims.
+func validateHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"valid": false})
+		return
+	}
+
+	claims, err := parseToken(req.Token)
+	if err != nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"valid": false})
+		return
+	}
+
+	// Return claims in a stable, type-tagged shape the UI can map.
+	claimList := []map[string]interface{}{}
+	if v, ok := claims["id"]; ok {
+		claimList = append(claimList, map[string]interface{}{"type": "nameidentifier", "value": fmt.Sprintf("%v", int64(toFloat(v)))})
+	}
+	if v, ok := claims["username"]; ok {
+		claimList = append(claimList, map[string]interface{}{"type": "name", "value": fmt.Sprintf("%v", v)})
+	}
+	if v, ok := claims["role"]; ok {
+		claimList = append(claimList, map[string]interface{}{"type": "role", "value": fmt.Sprintf("%v", v)})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"valid":  true,
+		"claims": claimList,
+	})
+}
+
+func toFloat(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int64:
+		return float64(n)
+	case int:
+		return float64(n)
+	}
+	return 0
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -867,15 +1056,15 @@ func getRoutesHandler(w http.ResponseWriter, r *http.Request) {
 		var niCbT, niCbD, niCacheT sql.NullInt64
 
 		rows.Scan(&id, &routeID, &clusterID, &matchPath, &rateLimit, &isActive, &nsMethods, &niCbT, &niCbD, &nsIpW, &nsIpB, &niCacheT, &nsTransforms)
-		
+
 		routes = append(routes, map[string]interface{}{
-			"id":                 id,
-			"routeId":            routeID,
-			"clusterId":          clusterID,
-			"matchPath":          matchPath,
-			"rateLimitPerSecond": rateLimit,
-			"isActive":           isActive,
-			"methods":            nsMethods.String,
+			"id":                            id,
+			"routeId":                       routeID,
+			"clusterId":                     clusterID,
+			"matchPath":                     matchPath,
+			"rateLimitPerSecond":            rateLimit,
+			"isActive":                      isActive,
+			"methods":                       nsMethods.String,
 			"circuitBreakerThreshold":       niCbT.Int64,
 			"circuitBreakerDurationSeconds": niCbD.Int64,
 			"ipWhitelist":                   nsIpW.String,
@@ -893,11 +1082,11 @@ func getRoutesHandler(w http.ResponseWriter, r *http.Request) {
 
 func createRouteHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		RouteID            string `json:"routeId"`
-		ClusterID          string `json:"clusterId"`
-		MatchPath          string `json:"matchPath"`
-		RateLimitPerSecond int    `json:"rateLimitPerSecond"`
-		IsActive           bool   `json:"isActive"`
+		RouteID                       string `json:"routeId"`
+		ClusterID                     string `json:"clusterId"`
+		MatchPath                     string `json:"matchPath"`
+		RateLimitPerSecond            int    `json:"rateLimitPerSecond"`
+		IsActive                      bool   `json:"isActive"`
 		Methods                       string `json:"methods"`
 		CircuitBreakerThreshold       int    `json:"circuitBreakerThreshold"`
 		CircuitBreakerDurationSeconds int    `json:"circuitBreakerDurationSeconds"`
@@ -926,19 +1115,19 @@ func createRouteHandler(w http.ResponseWriter, r *http.Request) {
 	routeCache.Delete("routes:all")
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                 id,
-		"routeId":            req.RouteID,
-		"clusterId":          req.ClusterID,
-		"matchPath":          req.MatchPath,
-		"rateLimitPerSecond": req.RateLimitPerSecond,
-		"isActive":           req.IsActive,
-		"methods":            req.Methods,
-		"circuitBreakerThreshold": req.CircuitBreakerThreshold,
+		"id":                            id,
+		"routeId":                       req.RouteID,
+		"clusterId":                     req.ClusterID,
+		"matchPath":                     req.MatchPath,
+		"rateLimitPerSecond":            req.RateLimitPerSecond,
+		"isActive":                      req.IsActive,
+		"methods":                       req.Methods,
+		"circuitBreakerThreshold":       req.CircuitBreakerThreshold,
 		"circuitBreakerDurationSeconds": req.CircuitBreakerDurationSeconds,
-		"ipWhitelist": req.IpWhitelist,
-		"ipBlacklist": req.IpBlacklist,
-		"cacheTtlSeconds": req.CacheTtlSeconds,
-		"transformsJson": req.TransformsJson,
+		"ipWhitelist":                   req.IpWhitelist,
+		"ipBlacklist":                   req.IpBlacklist,
+		"cacheTtlSeconds":               req.CacheTtlSeconds,
+		"transformsJson":                req.TransformsJson,
 	})
 }
 
@@ -947,11 +1136,11 @@ func updateRouteHandler(w http.ResponseWriter, r *http.Request) {
 	id := vars["id"]
 
 	var req struct {
-		RouteID            string `json:"routeId"`
-		ClusterID          string `json:"clusterId"`
-		MatchPath          string `json:"matchPath"`
-		RateLimitPerSecond int    `json:"rateLimitPerSecond"`
-		IsActive           bool   `json:"isActive"`
+		RouteID                       string `json:"routeId"`
+		ClusterID                     string `json:"clusterId"`
+		MatchPath                     string `json:"matchPath"`
+		RateLimitPerSecond            int    `json:"rateLimitPerSecond"`
+		IsActive                      bool   `json:"isActive"`
 		Methods                       string `json:"methods"`
 		CircuitBreakerThreshold       int    `json:"circuitBreakerThreshold"`
 		CircuitBreakerDurationSeconds int    `json:"circuitBreakerDurationSeconds"`
@@ -984,19 +1173,19 @@ func updateRouteHandler(w http.ResponseWriter, r *http.Request) {
 	routeCache.Delete("routes:all")
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                 id,
-		"routeId":            req.RouteID,
-		"clusterId":          req.ClusterID,
-		"matchPath":          req.MatchPath,
-		"rateLimitPerSecond": req.RateLimitPerSecond,
-		"isActive":           req.IsActive,
-		"methods":            req.Methods,
-		"circuitBreakerThreshold": req.CircuitBreakerThreshold,
+		"id":                            id,
+		"routeId":                       req.RouteID,
+		"clusterId":                     req.ClusterID,
+		"matchPath":                     req.MatchPath,
+		"rateLimitPerSecond":            req.RateLimitPerSecond,
+		"isActive":                      req.IsActive,
+		"methods":                       req.Methods,
+		"circuitBreakerThreshold":       req.CircuitBreakerThreshold,
 		"circuitBreakerDurationSeconds": req.CircuitBreakerDurationSeconds,
-		"ipWhitelist": req.IpWhitelist,
-		"ipBlacklist": req.IpBlacklist,
-		"cacheTtlSeconds": req.CacheTtlSeconds,
-		"transformsJson": req.TransformsJson,
+		"ipWhitelist":                   req.IpWhitelist,
+		"ipBlacklist":                   req.IpBlacklist,
+		"cacheTtlSeconds":               req.CacheTtlSeconds,
+		"transformsJson":                req.TransformsJson,
 	})
 }
 
@@ -1043,26 +1232,28 @@ func getClustersHandler(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var clusterID, destJSON, lbPolicy string
 		var isActive bool
-        var niEh, niHint, niHtout, niRtry, niRdel sql.NullInt64
-        var nsHth sql.NullString
+		var niEh, niHint, niHtout, niRtry, niRdel sql.NullInt64
+		var nsHth sql.NullString
 
 		rows.Scan(&id, &clusterID, &destJSON, &lbPolicy, &isActive, &niEh, &nsHth, &niHint, &niHtout, &niRtry, &niRdel)
 
-        eh := true
-        if niEh.Valid && niEh.Int64 == 0 { eh = false }
+		eh := true
+		if niEh.Valid && niEh.Int64 == 0 {
+			eh = false
+		}
 
 		clusters = append(clusters, map[string]interface{}{
-			"id":                  id,
-			"clusterId":           clusterID,
-			"destinationsJson":    destJSON,
-			"loadBalancingPolicy": lbPolicy,
-			"isActive":            isActive,
-            "enableHealthCheck":   eh,
-            "healthCheckPath":     nsHth.String,
-            "healthCheckIntervalSeconds": niHint.Int64,
-            "healthCheckTimeoutSeconds": niHtout.Int64,
-            "retryCount":          niRtry.Int64,
-            "retryDelayMs":        niRdel.Int64,
+			"id":                         id,
+			"clusterId":                  clusterID,
+			"destinationsJson":           destJSON,
+			"loadBalancingPolicy":        lbPolicy,
+			"isActive":                   isActive,
+			"enableHealthCheck":          eh,
+			"healthCheckPath":            nsHth.String,
+			"healthCheckIntervalSeconds": niHint.Int64,
+			"healthCheckTimeoutSeconds":  niHtout.Int64,
+			"retryCount":                 niRtry.Int64,
+			"retryDelayMs":               niRdel.Int64,
 		})
 	}
 
@@ -1074,10 +1265,10 @@ func getClustersHandler(w http.ResponseWriter, r *http.Request) {
 
 func createClusterHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ClusterID           string        `json:"clusterId"`
-		DestinationsJson    string        `json:"destinationsJson"`
-		LoadBalancingPolicy string        `json:"loadBalancingPolicy"`
-		IsActive            bool          `json:"isActive"`
+		ClusterID                  string `json:"clusterId"`
+		DestinationsJson           string `json:"destinationsJson"`
+		LoadBalancingPolicy        string `json:"loadBalancingPolicy"`
+		IsActive                   bool   `json:"isActive"`
 		EnableHealthCheck          bool   `json:"enableHealthCheck"`
 		HealthCheckPath            string `json:"healthCheckPath"`
 		HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
@@ -1092,7 +1283,9 @@ func createClusterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eh := 0
-	if req.EnableHealthCheck { eh = 1 }
+	if req.EnableHealthCheck {
+		eh = 1
+	}
 
 	result, err := db.Exec("INSERT INTO Clusters (ClusterId, DestinationsJson, LoadBalancingPolicy, IsActive, EnableHealthCheck, HealthCheckPath, HealthCheckIntervalSeconds, HealthCheckTimeoutSeconds, RetryCount, RetryDelayMs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		req.ClusterID, req.DestinationsJson, req.LoadBalancingPolicy, true, eh, req.HealthCheckPath, req.HealthCheckIntervalSeconds, req.HealthCheckTimeoutSeconds, req.RetryCount, req.RetryDelayMs)
@@ -1108,17 +1301,17 @@ func createClusterHandler(w http.ResponseWriter, r *http.Request) {
 	clusterCache.Delete("clusters:all")
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                  id,
-		"clusterId":           req.ClusterID,
-		"destinationsJson":    req.DestinationsJson,
-		"loadBalancingPolicy": req.LoadBalancingPolicy,
-		"isActive":            req.IsActive,
-		"enableHealthCheck":   req.EnableHealthCheck,
-		"healthCheckPath":     req.HealthCheckPath,
+		"id":                         id,
+		"clusterId":                  req.ClusterID,
+		"destinationsJson":           req.DestinationsJson,
+		"loadBalancingPolicy":        req.LoadBalancingPolicy,
+		"isActive":                   req.IsActive,
+		"enableHealthCheck":          req.EnableHealthCheck,
+		"healthCheckPath":            req.HealthCheckPath,
 		"healthCheckIntervalSeconds": req.HealthCheckIntervalSeconds,
 		"healthCheckTimeoutSeconds":  req.HealthCheckTimeoutSeconds,
-		"retryCount":          req.RetryCount,
-		"retryDelayMs":        req.RetryDelayMs,
+		"retryCount":                 req.RetryCount,
+		"retryDelayMs":               req.RetryDelayMs,
 	})
 }
 
@@ -1127,10 +1320,10 @@ func updateClusterHandler(w http.ResponseWriter, r *http.Request) {
 	id := vars["id"]
 
 	var req struct {
-		ClusterID           string        `json:"clusterId"`
-		DestinationsJson    string        `json:"destinationsJson"`
-		LoadBalancingPolicy string        `json:"loadBalancingPolicy"`
-		IsActive            bool          `json:"isActive"`
+		ClusterID                  string `json:"clusterId"`
+		DestinationsJson           string `json:"destinationsJson"`
+		LoadBalancingPolicy        string `json:"loadBalancingPolicy"`
+		IsActive                   bool   `json:"isActive"`
 		EnableHealthCheck          bool   `json:"enableHealthCheck"`
 		HealthCheckPath            string `json:"healthCheckPath"`
 		HealthCheckIntervalSeconds int    `json:"healthCheckIntervalSeconds"`
@@ -1145,7 +1338,9 @@ func updateClusterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eh := 0
-	if req.EnableHealthCheck { eh = 1 }
+	if req.EnableHealthCheck {
+		eh = 1
+	}
 
 	result, err := db.Exec("UPDATE Clusters SET ClusterId = ?, DestinationsJson = ?, LoadBalancingPolicy = ?, IsActive = ?, EnableHealthCheck = ?, HealthCheckPath = ?, HealthCheckIntervalSeconds = ?, HealthCheckTimeoutSeconds = ?, RetryCount = ?, RetryDelayMs = ? WHERE Id = ?",
 		req.ClusterID, req.DestinationsJson, req.LoadBalancingPolicy, true, eh, req.HealthCheckPath, req.HealthCheckIntervalSeconds, req.HealthCheckTimeoutSeconds, req.RetryCount, req.RetryDelayMs, id)
@@ -1165,17 +1360,17 @@ func updateClusterHandler(w http.ResponseWriter, r *http.Request) {
 	clusterCache.Delete("clusters:all")
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                  id,
-		"clusterId":           req.ClusterID,
-		"destinationsJson":    req.DestinationsJson,
-		"loadBalancingPolicy": req.LoadBalancingPolicy,
-		"isActive":            req.IsActive,
-		"enableHealthCheck":   req.EnableHealthCheck,
-		"healthCheckPath":     req.HealthCheckPath,
+		"id":                         id,
+		"clusterId":                  req.ClusterID,
+		"destinationsJson":           req.DestinationsJson,
+		"loadBalancingPolicy":        req.LoadBalancingPolicy,
+		"isActive":                   req.IsActive,
+		"enableHealthCheck":          req.EnableHealthCheck,
+		"healthCheckPath":            req.HealthCheckPath,
 		"healthCheckIntervalSeconds": req.HealthCheckIntervalSeconds,
 		"healthCheckTimeoutSeconds":  req.HealthCheckTimeoutSeconds,
-		"retryCount":          req.RetryCount,
-		"retryDelayMs":        req.RetryDelayMs,
+		"retryCount":                 req.RetryCount,
+		"retryDelayMs":               req.RetryDelayMs,
 	})
 }
 
@@ -1203,13 +1398,35 @@ func deleteClusterHandler(w http.ResponseWriter, r *http.Request) {
 
 // Metrics handlers
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	routeMetricsMu.RLock()
-	defer routeMetricsMu.RUnlock()
+	uptime := int64(time.Since(globalMetrics.StartTime).Seconds())
 
 	routesMap := make(map[string]RouteMetrics)
-	for k, v := range routeMetricsMap {
-		routesMap[k] = *v
-	}
+	routeMetricsMap.Range(func(key, value interface{}) bool {
+		st := value.(*routeStat)
+		total := atomic.LoadInt64(&st.total)
+		success := atomic.LoadInt64(&st.success)
+		errCount := atomic.LoadInt64(&st.errCount)
+		totalLatency := atomic.LoadInt64(&st.totalLatency)
+		maxLatency := atomic.LoadInt64(&st.maxLatency)
+
+		m := RouteMetrics{
+			TotalRequests:  total,
+			SuccessCount:   success,
+			ErrorCount:     errCount,
+			TotalLatencyMs: totalLatency,
+			MaxLatencyMs:   int(maxLatency),
+			UptimeSeconds:  uptime,
+		}
+		if total > 0 {
+			m.AvgLatencyMs = int(totalLatency / total)
+			m.ErrorRate = (float64(errCount) / float64(total)) * 100
+		}
+		if uptime > 0 {
+			m.ThroughputPerSecond = float64(total) / float64(uptime)
+		}
+		routesMap[key.(string)] = m
+		return true
+	})
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"routes":        routesMap,
@@ -1220,23 +1437,24 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func resetMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	routeMetricsMu.Lock()
-	routeMetricsMap = make(map[string]*RouteMetrics)
-	routeMetricsMu.Unlock()
+	routeMetricsMap.Range(func(key, _ interface{}) bool {
+		routeMetricsMap.Delete(key)
+		return true
+	})
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func getLogsHandler(w http.ResponseWriter, r *http.Request) {
 	page := 1
 	pageSize := 50
-	
+
 	if p := r.URL.Query().Get("page"); p != "" {
 		fmt.Sscanf(p, "%d", &page)
 	}
 	if ps := r.URL.Query().Get("pageSize"); ps != "" {
 		fmt.Sscanf(ps, "%d", &pageSize)
 	}
-	
+
 	offset := (page - 1) * pageSize
 
 	whereClauses := []string{"1=1"}
@@ -1258,7 +1476,7 @@ func getLogsHandler(w http.ResponseWriter, r *http.Request) {
 	whereQuery := strings.Join(whereClauses, " AND ")
 
 	var total int
-	db.QueryRow("SELECT COUNT(*) FROM RequestLogs WHERE " + whereQuery, args...).Scan(&total)
+	db.QueryRow("SELECT COUNT(*) FROM RequestLogs WHERE "+whereQuery, args...).Scan(&total)
 
 	query := "SELECT Id, Timestamp, Method, Path, StatusCode, LatencyMs, ClientIp, RouteId FROM RequestLogs WHERE " + whereQuery + " ORDER BY Id DESC LIMIT ? OFFSET ?"
 	args = append(args, pageSize, offset)
@@ -1274,9 +1492,9 @@ func getLogsHandler(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, statusCode, latency int
 		var ts, method, path, clientIp, routeId string
-		
+
 		rows.Scan(&id, &ts, &method, &path, &statusCode, &latency, &clientIp, &routeId)
-		
+
 		logs = append(logs, map[string]interface{}{
 			"id":         id,
 			"timestamp":  ts,
@@ -1288,7 +1506,7 @@ func getLogsHandler(w http.ResponseWriter, r *http.Request) {
 			"routeId":    routeId,
 		})
 	}
-	
+
 	if logs == nil {
 		logs = []map[string]interface{}{}
 	}
@@ -1301,6 +1519,25 @@ func getLogsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func clearLogsHandler(w http.ResponseWriter, r *http.Request) {
+	// Optional ?olderThanDays=N purges only logs older than N days; without it,
+	// all logs are cleared (preserves existing behaviour).
+	if d := r.URL.Query().Get("olderThanDays"); d != "" {
+		days, err := strconv.Atoi(d)
+		if err != nil || days < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid olderThanDays"})
+			return
+		}
+		cutoff := time.Now().AddDate(0, 0, -days).Format(time.RFC3339)
+		res, err := db.Exec("DELETE FROM RequestLogs WHERE Timestamp < ?", cutoff)
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		removed, _ := res.RowsAffected()
+		respondJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "removed": removed})
+		return
+	}
+
 	db.Exec("DELETE FROM RequestLogs")
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -1333,10 +1570,13 @@ func getLogStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"total":    total,
 		"last24h":  last24h,
 		"byStatus": byStatus,
+		"retention": map[string]interface{}{
+			"enabled":              LogRetentionDays > 0,
+			"retentionDays":        LogRetentionDays,
+			"cleanupIntervalHours": LogCleanupIntervalHours,
+		},
 	})
 }
-
-
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	var routeCount, clusterCount, userCount int
@@ -1345,11 +1585,11 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow("SELECT COUNT(*) FROM Users").Scan(&userCount)
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"totalRoutes":    routeCount,
-		"totalClusters":  clusterCount,
-		"totalUsers":     userCount,
-		"wsConnections":  atomic.LoadInt64(&globalMetrics.WSConnections),
-		"uptime":         int(time.Since(globalMetrics.StartTime).Seconds()),
+		"totalRoutes":   routeCount,
+		"totalClusters": clusterCount,
+		"totalUsers":    userCount,
+		"wsConnections": atomic.LoadInt64(&globalMetrics.WSConnections),
+		"uptime":        int(time.Since(globalMetrics.StartTime).Seconds()),
 	})
 }
 
@@ -1382,15 +1622,15 @@ func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
 			var niCbT, niCbD, niCacheT sql.NullInt64
 
 			rows.Scan(&id, &routeID, &clusterID, &matchPath, &rateLimit, &isActive, &nsMethods, &niCbT, &niCbD, &nsIpW, &nsIpB, &niCacheT, &nsTransforms)
-			
+
 			routes = append(routes, map[string]interface{}{
-				"id":                 id,
-				"routeId":            routeID,
-				"clusterId":          clusterID,
-				"matchPath":          matchPath,
-				"rateLimitPerSecond": rateLimit,
-				"isActive":           isActive,
-				"methods":            nsMethods.String,
+				"id":                            id,
+				"routeId":                       routeID,
+				"clusterId":                     clusterID,
+				"matchPath":                     matchPath,
+				"rateLimitPerSecond":            rateLimit,
+				"isActive":                      isActive,
+				"methods":                       nsMethods.String,
 				"circuitBreakerThreshold":       niCbT.Int64,
 				"circuitBreakerDurationSeconds": niCbD.Int64,
 				"ipWhitelist":                   nsIpW.String,
@@ -1427,7 +1667,7 @@ func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
 	routeID := matchedRoute["routeId"].(string)
 	req.Header.Set("X-Gateway-RouteId", routeID)
 	clusterID := matchedRoute["clusterId"].(string)
-	
+
 	rateLimit := 0
 	if rl, ok := matchedRoute["rateLimitPerSecond"].(int); ok {
 		rateLimit = rl
@@ -1474,15 +1714,13 @@ func dynamicProxyHandler(w http.ResponseWriter, req *http.Request) {
 		respondJSON(w, http.StatusBadGateway, map[string]string{"error": "Invalid gateway upstream URL"})
 		return
 	}
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy := getReverseProxy(targetURL)
 
-	originalPath := req.URL.Path
 	req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
 	if req.URL.Path == "" {
 		req.URL.Path = "/"
 	}
 
-	log.Printf("[DYNAMIC PROXY] %s %s -> %s%s (stripped: %s)\n", req.Method, originalPath, target, req.URL.Path, prefix)
 	proxy.ServeHTTP(w, req)
 }
 
@@ -1502,6 +1740,67 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			return n
+		}
+	}
+	return defaultValue
+}
+
+// generateTokenPair issues a signed access token and refresh token for a user.
+// Centralizes claim shape and TTLs so login and refresh stay in sync.
+func generateTokenPair(id int64, username, role string) (string, string, error) {
+	now := time.Now()
+
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"id":       id,
+		"username": username,
+		"role":     role,
+		"typ":      "access",
+		"exp":      now.Add(AccessTokenTTL).Unix(),
+		"iat":      now.Unix(),
+	})
+	accessTokenString, err := accessToken.SignedString(JWTSecret)
+	if err != nil {
+		return "", "", err
+	}
+
+	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"id":       id,
+		"username": username,
+		"typ":      "refresh",
+		"exp":      now.Add(RefreshTokenTTL).Unix(),
+		"iat":      now.Unix(),
+	})
+	refreshTokenString, err := refreshToken.SignedString(JWTSecret)
+	if err != nil {
+		return "", "", err
+	}
+
+	return accessTokenString, refreshTokenString, nil
+}
+
+// parseToken validates a JWT string, pinning the signing method to HMAC to
+// prevent algorithm-confusion attacks.
+func parseToken(tokenString string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return JWTSecret, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+	return claims, nil
 }
 
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {

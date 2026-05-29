@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { login as apiLogin, validateToken } from '../api/gatewayApi';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { App as AntApp } from 'antd';
+import { login as apiLogin, validateToken, setAuthFailureHandler } from '../api/gatewayApi';
 import axios from 'axios';
 
 const AuthContext = createContext(null);
@@ -16,6 +17,47 @@ const getApiBase = () => {
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const { message } = AntApp.useApp();
+
+  const logout = useCallback(async () => {
+    const refreshToken = localStorage.getItem('refreshToken');
+
+    // Call logout endpoint (fire-and-forget)
+    if (refreshToken) {
+      try {
+        await axios.post(
+          `${getApiBase()}/auth/logout`,
+          { refreshToken },
+          {
+            headers: {
+              Authorization: `Bearer ${localStorage.getItem('accessToken')}`
+            }
+          }
+        );
+      } catch {
+        // Ignore errors
+      }
+    }
+
+    localStorage.removeItem('accessToken');
+    localStorage.removeItem('refreshToken');
+    setUser(null);
+  }, []);
+
+  // Let the API layer tell us when auth is unrecoverable (refresh failed).
+  useEffect(() => {
+    setAuthFailureHandler(() => {
+      // Only notify if the user was actually logged in (avoid noise on the
+      // login screen where there's no session to expire).
+      if (localStorage.getItem('accessToken')) {
+        message.warning('Your session has expired. Please sign in again.');
+      }
+      localStorage.removeItem('accessToken');
+      localStorage.removeItem('refreshToken');
+      setUser(null);
+    });
+    return () => setAuthFailureHandler(null);
+  }, [message]);
 
   useEffect(() => {
     // Validate token on mount
@@ -39,51 +81,7 @@ export function AuthProvider({ children }) {
     } else {
       setLoading(false);
     }
-  }, []);
-
-  // Setup axios interceptor for automatic token refresh
-  useEffect(() => {
-    const interceptor = axios.interceptors.response.use(
-      response => response,
-      async error => {
-        const originalRequest = error.config;
-
-        // If 401 and not already retried, try to refresh token
-        if (error.response?.status === 401 && !originalRequest._retry) {
-          originalRequest._retry = true;
-
-          const refreshToken = localStorage.getItem('refreshToken');
-          if (refreshToken) {
-            try {
-              const res = await axios.post(
-                `${getApiBase()}/auth/refresh`,
-                { refreshToken }
-              );
-
-              const { accessToken: newAccessToken, refreshToken: newRefreshToken } = res.data;
-
-              localStorage.setItem('accessToken', newAccessToken);
-              localStorage.setItem('refreshToken', newRefreshToken);
-
-              // Retry original request with new token
-              originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
-              return axios(originalRequest);
-            } catch (refreshError) {
-              // Refresh failed, logout user
-              logout();
-              return Promise.reject(refreshError);
-            }
-          }
-        }
-
-        return Promise.reject(error);
-      }
-    );
-
-    return () => {
-      axios.interceptors.response.eject(interceptor);
-    };
-  }, []);
+  }, [logout]);
 
   const login = async (username, password) => {
     const res = await apiLogin(username, password);
@@ -94,31 +92,6 @@ export function AuthProvider({ children }) {
 
     setUser(userData);
     return userData;
-  };
-
-  const logout = async () => {
-    const refreshToken = localStorage.getItem('refreshToken');
-
-    // Call logout endpoint (fire-and-forget)
-    if (refreshToken) {
-      try {
-        await axios.post(
-          `${getApiBase()}/auth/logout`,
-          { refreshToken },
-          {
-            headers: {
-              Authorization: `Bearer ${localStorage.getItem('accessToken')}`
-            }
-          }
-        );
-      } catch {
-        // Ignore errors
-      }
-    }
-
-    localStorage.removeItem('accessToken');
-    localStorage.removeItem('refreshToken');
-    setUser(null);
   };
 
   return (

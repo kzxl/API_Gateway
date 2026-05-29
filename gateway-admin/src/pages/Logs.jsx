@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
 import {
-  Table, Card, Tag, Spin, Typography, Button, Space, App, Select, Input, Row, Col, Statistic, Switch, Skeleton
+  Table, Card, Tag, Spin, Typography, Button, Space, App, Select, Input, Row, Col, Statistic, Switch, Skeleton, Dropdown, Tooltip
 } from "antd";
 import {
-  ReloadOutlined, DeleteOutlined, FileTextOutlined, ClockCircleOutlined,
+  ReloadOutlined, DeleteOutlined, FileTextOutlined, ClockCircleOutlined, DownOutlined, ClearOutlined,
 } from "@ant-design/icons";
 import { getLogs, clearLogs, getLogStats } from "../api/gatewayApi";
 
@@ -38,9 +38,35 @@ export default function Logs() {
   const handleClear = () => {
     modal.confirm({
       title: "Clear all logs?",
+      content: "This permanently removes every request log entry.",
+      okButtonProps: { danger: true },
       onOk: async () => { await clearLogs(); message.success("Logs cleared"); load(1); },
     });
   };
+
+  const handleClearOlderThan = (days) => {
+    modal.confirm({
+      title: `Clear logs older than ${days} day(s)?`,
+      content: "Recent logs are kept; only older entries are removed.",
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        const res = await clearLogs(days);
+        const removed = res?.data?.removed ?? 0;
+        message.success(`Removed ${removed} old log entr${removed === 1 ? "y" : "ies"}`);
+        load(1);
+      },
+    });
+  };
+
+  const clearMenuItems = [
+    { key: "1", label: "Older than 1 day" },
+    { key: "7", label: "Older than 7 days" },
+    { key: "30", label: "Older than 30 days" },
+    { type: "divider" },
+    { key: "all", label: "Clear all logs", danger: true },
+  ];
+
+  const retention = stats?.retention;
 
   // Process Logs: rename Unknown to System, filter based on showSystem
   const processedLogs = logs
@@ -50,7 +76,18 @@ export default function Logs() {
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <Title level={3} style={{ margin: 0 }}>Request Logs</Title>
+        <Space align="center">
+          <Title level={3} style={{ margin: 0 }}>Request Logs</Title>
+          {retention && (
+            <Tooltip title={retention.enabled
+              ? `Logs older than ${retention.retentionDays} day(s) are purged automatically every ${retention.cleanupIntervalHours}h`
+              : "Automatic log cleanup is disabled"}>
+              <Tag color={retention.enabled ? "green" : "default"} icon={<ClearOutlined />}>
+                {retention.enabled ? `Auto-clean: ${retention.retentionDays}d` : "Auto-clean: off"}
+              </Tag>
+            </Tooltip>
+          )}
+        </Space>
         <Space wrap>
           <Switch 
             checkedChildren="System: ON" 
@@ -59,7 +96,16 @@ export default function Logs() {
             onChange={setShowSystem} 
           />
           <Button icon={<ReloadOutlined />} onClick={() => load()}>Refresh</Button>
-          <Button danger icon={<DeleteOutlined />} onClick={handleClear}>Clear</Button>
+          <Dropdown
+            menu={{
+              items: clearMenuItems,
+              onClick: ({ key }) => (key === "all" ? handleClear() : handleClearOlderThan(Number(key))),
+            }}
+          >
+            <Button danger icon={<DeleteOutlined />}>
+              <Space>Clear<DownOutlined /></Space>
+            </Button>
+          </Dropdown>
         </Space>
       </div>
 
