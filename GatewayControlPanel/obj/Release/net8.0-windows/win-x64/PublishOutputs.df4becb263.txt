@@ -1,0 +1,2 @@
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\lite\GatewayControlPanel.pdb
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\lite\GatewayControlPanel.exe

@@ -1,0 +1,7 @@
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\GatewayControlPanel.pdb
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\D3DCompiler_47_cor3.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\PenImc_cor3.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\PresentationNative_cor3.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\vcruntime140_cor3.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\wpfgfx_cor3.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\publish\full\GatewayControlPanel.exe

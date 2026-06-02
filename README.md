@@ -12,6 +12,11 @@
 
 ---
 
+## 🔄 Recent Updates (2026-06-02)
+- **Go Backend & Admin UI Rebuild**: Rebuilt the Go backend (`gateway-go`) and React Admin panel (`gateway-admin`) using the latest source code.
+- **WPF Control Panel Release**: Recompiled the WPF Control Panel (`GatewayControlPanel`) targeting .NET 8.0-Windows in Release mode, supporting both Lite (framework-dependent, ~885 KB) and Full (self-contained, ~154 MB) deployment variants.
+- **Distribution Package**: Synced the newly compiled Go backend, Admin UI static web files, and Control Panel executable into the unified `publish-final` distribution package.
+
 ## 🔄 Recent Updates (2026-05-14)
 - **Gateway Admin UI**: Upgraded Admin dashboard UX/UI with premium glassmorphism dark/light mode, real-time traffic line charts, auto-refresh intervals, and advanced routing filters for System requests.
 - **IIS Deployment**: Fixed React SPA routing on IIS 10 with web.config URL rewrite rules.

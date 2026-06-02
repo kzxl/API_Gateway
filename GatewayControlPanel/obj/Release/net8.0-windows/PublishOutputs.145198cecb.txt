@@ -1,0 +1,6 @@
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\GatewayControlPanel.exe
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\GatewayControlPanel.dll
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\GatewayControlPanel.deps.json
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\GatewayControlPanel.runtimeconfig.json
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\GatewayControlPanel.pdb
+E:\15. Other\services\API_Gateway\GatewayControlPanel\bin\Release\net8.0-windows\publish\Newtonsoft.Json.dll
